@@ -1,0 +1,9 @@
+{
+  "state": "untrained",
+  "architecture": "tiny-eye-v1",
+  "method": "grayscale8",
+  "checkpoint_sha256": null,
+  "fingerprint": 0,
+  "model_bytes": 1208,
+  "scope": "No embedded trained model. Runtime UART loading is required before CNN inference."
+}

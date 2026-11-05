@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "identity_map": {},
+  "datasets": [
+    {
+      "dataset": "RTBENE",
+      "version": "1.0.0",
+      "source_url": "https://zenodo.org/records/3685316",
+      "license": "CC BY-NC-SA 4.0",
+      "rights_note": "Replace with your documented lawful noncommercial research use and attribution record",
+      "approved_local_use": false,
+      "root": "D:/licensed_data/rtbene/downloads",
+      "subjects": [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+      "external_test": false
+    },
+    {
+      "dataset": "MRL",
+      "version": "publisher download version, record date/hash",
+      "source_url": "https://mrl.cs.vsb.cz/eyedataset.html",
+      "license": "Publisher terms; verify your local research use, no assumed redistribution rights",
+      "rights_note": "Replace with access/rights confirmation",
+      "approved_local_use": false,
+      "root": "D:/licensed_data/mrl",
+      "external_test": true
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+# ALINX AX309, XC6SLX9-2FTG256C.
+# Source: ALINX AX309 User Manual, tables 4-1, 12-1, 13-1, 15-1.
+# https://www.alinx.com/public/upload/file/AX309_User_Manual.pdf
+NET "clk" LOC = "T8" | IOSTANDARD = LVCMOS33;
+NET "clk" TNM_NET = "board_clock";
+TIMESPEC "TS_board_clock" = PERIOD "board_clock" 20 ns HIGH 50%;
+
+NET "key<0>" LOC = "C3" | IOSTANDARD = LVCMOS33;
+NET "key<1>" LOC = "D3" | IOSTANDARD = LVCMOS33;
+NET "key<2>" LOC = "E4" | IOSTANDARD = LVCMOS33;
+NET "key<3>" LOC = "E3" | IOSTANDARD = LVCMOS33;
+
+NET "led<0>" LOC = "P4" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "led<1>" LOC = "N5" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "led<2>" LOC = "P5" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "led<3>" LOC = "M6" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+
+NET "seg<0>" LOC = "C7" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "seg<1>" LOC = "E6" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "seg<2>" LOC = "C5" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "seg<3>" LOC = "F7" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "seg<4>" LOC = "D6" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "seg<5>" LOC = "E7" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "seg<6>" LOC = "D5" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "seg<7>" LOC = "C6" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+
+# digit[0] is rightmost on the physical board (operator-confirmed orientation).
+NET "digit<0>" LOC = "D8" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "digit<1>" LOC = "E8" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "digit<2>" LOC = "F9" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "digit<3>" LOC = "F10" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "digit<4>" LOC = "E10" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+NET "digit<5>" LOC = "D9" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;
+
+# CP2102 TXD -> RXD/C11; FPGA TXD/D12 -> CP2102 RXD (AX309 schematic sheet 1).
+NET "uart_rx_pin" LOC = "C11" | IOSTANDARD = LVCMOS33;
+NET "uart_tx_pin" LOC = "D12" | IOSTANDARD = LVCMOS33 | DRIVE = 8 | SLEW = SLOW;

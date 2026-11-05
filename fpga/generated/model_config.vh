@@ -1,0 +1,2 @@
+localparam [7:0] DEFAULT_METHOD=8'd0;
+localparam [31:0] DEFAULT_FINGERPRINT=32'h00000000;
