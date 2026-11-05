@@ -17,9 +17,9 @@ def observations(path):
         rows = list(csv.DictReader(stream))
     result = []
     for row in rows:
-        item = {"t_ms": float(row.get("t_ms", row.get("timestamp_ms", "")))}
+        item = {"t_ms": float(row.get("t_ms", row.get("timestamp_ms", row.get("capture_ms", ""))))}
         for side in ("left", "right"):
-            item[side + "_state"] = row[side + "_state"]
+            item[side + "_state"] = (row[side + "_state"] if row.get("validity", "valid") == "valid" else "UNAVAILABLE")
             value = row.get(side + "_open_fraction", "")
             item[side + "_open_fraction"] = None if value == "" else float(value)
         result.append(item)
@@ -89,6 +89,7 @@ def summarize(samples, *, start_ms=None, end_ms=None, max_gap_ms=250,
     for side in ("left", "right"):
         observed = closed = aperture_ms = perclos_ms = 0.0
         closures, events, event_segments, gaps, segment = [], [], [], 0, 0
+        observed_closures = []
         armed = None
         for a, b in zip(samples, samples[1:]):
             ta, tb = a["t_ms"], b["t_ms"]
@@ -103,6 +104,13 @@ def summarize(samples, *, start_ms=None, end_ms=None, max_gap_ms=250,
                 continue
             observed += dt
             closed += dt if state == "CLOSED" else 0
+            if state == "CLOSED":
+                lo, hi = max(ta, begin), min(tb, end)
+                if observed_closures and observed_closures[-1]["end_ms"] == lo:
+                    observed_closures[-1]["end_ms"] = hi
+                    observed_closures[-1]["duration_ms"] = hi-observed_closures[-1]["start_ms"]
+                else:
+                    observed_closures.append(dict(start_ms=lo, end_ms=hi, duration_ms=hi-lo))
             aperture = a.get(side + "_open_fraction")
             if calibrated and aperture is not None and b.get(side + "_open_fraction") is not None:
                 aperture_ms += dt
@@ -134,8 +142,78 @@ def summarize(samples, *, start_ms=None, end_ms=None, max_gap_ms=250,
             "mean_interblink_ms": statistics.mean(intervals) if intervals else None,
             "long_closure_count": sum(c["duration_ms"] >= long_closure_ms for c in closures) if observed else None,
             "events": events,
+            "observed_closures": observed_closures,
+            "longest_observed_closure_ms": max((c["duration_ms"] for c in observed_closures), default=0) if observed else None,
             "status": "UNAVAILABLE" if not observed else "low_coverage" if coverage < 0.8 else
                       "insufficient_duration" if observed < minimum_rate_duration_ms else "descriptive_only"}
+    return result
+
+
+def indicator_policy():
+    return json.loads((Path(__file__).resolve().parents[1]/"research_ext/protocol.json").read_text())["indicator"]
+
+
+def ocular_indicator(coverage, observed_ms, closed_fraction, longest_ms, *, full_window=True, policy=None):
+    policy = policy or indicator_policy()
+    if (not full_window or coverage is None or observed_ms is None or closed_fraction is None or longest_ms is None
+            or not all(math.isfinite(v) for v in (coverage, observed_ms, closed_fraction, longest_ms))
+            or coverage < policy["minimum_coverage"] or observed_ms < policy["minimum_observed_ms"]):
+        return "UNKNOWN"
+    if closed_fraction >= policy["high_closed_fraction"] or longest_ms >= policy["high_closure_ms"]:
+        return "HIGH"
+    if closed_fraction >= policy["moderate_closed_fraction"] or longest_ms >= policy["moderate_closure_ms"]:
+        return "MODERATE"
+    return "LOW"
+
+
+def temporal_report(samples, policy=None):
+    """Existing interval metrics plus binocular timer events; no learned fatigue model."""
+    from blink_timing import BinocularTimer
+    policy = policy or indicator_policy()
+    validate(samples)
+    joint = []
+    for row in samples:
+        states = [row[s+"_state"] for s in ("left", "right")]
+        state = "UNAVAILABLE" if "UNAVAILABLE" in states else "CLOSED" if states == ["CLOSED", "CLOSED"] else "OPEN"
+        joint.append(dict(t_ms=row["t_ms"], left_state=state, right_state=state))
+
+    def window(begin=None, end=None):
+        result = summarize(samples, start_ms=begin, end_ms=end)
+        joint_result = summarize(joint, start_ms=begin, end_ms=end)
+        eye = joint_result.get("eyes", {}).get("left", {})
+        timer, events = BinocularTimer(), []
+        for row in samples:
+            if (begin is not None and row["t_ms"] < begin) or (end is not None and row["t_ms"] > end):
+                continue
+            timing = timer.update(*[{"OPEN":0., "CLOSED":1.}.get(row[s+"_state"]) for s in ("left", "right")], int(row["t_ms"]) & 0xffffffff)
+            if timing.event:
+                events.append(dict(end_ms=row["t_ms"], duration_ms=timing.last_duration_ms))
+        observed = eye.get("observed_ms", 0)
+        durations = [e["duration_ms"] for e in events]
+        result["bilateral"] = dict(observed_ms=observed, coverage=eye.get("coverage_fraction"),
+            binary_closed_fraction=eye.get("closed_fraction"), longest_observed_closure_ms=eye.get("longest_observed_closure_ms"),
+            closure_intervals=eye.get("observed_closures", []), blink_count=timer.count if observed else None,
+            blink_rate_per_min=timer.count*60000/observed if observed >= 30000 else None,
+            blink_events=events, long_closure_count=timer.long_count if observed else None,
+            mean_blink_ms=statistics.mean(durations) if durations else None, max_blink_ms=max(durations, default=None))
+        result["indicator"] = ocular_indicator(eye.get("coverage_fraction"), observed, eye.get("closed_fraction"),
+            eye.get("longest_observed_closure_ms"), full_window=result["duration_ms"] == policy["window_ms"], policy=policy)
+        return result
+
+    result = dict(title="Experimental Ocular Fatigue Indicator", thresholds=policy, summary=window(), windows_seconds={})
+    for seconds in (30, 60):
+        windows = []
+        if len(samples) > 1:
+            begin, last = samples[0]["t_ms"], samples[-1]["t_ms"]
+            while begin < last:
+                end = min(begin+seconds*1000, last)
+                item = window(begin, end)
+                item["partial_window"] = end-begin < seconds*1000
+                windows.append(item)
+                begin += seconds*1000
+        result["windows_seconds"][str(seconds)] = windows
+    result["missing_intervals"] = [dict(start_ms=a["t_ms"], end_ms=b["t_ms"])
+        for a,b in zip(joint, joint[1:]) if b["t_ms"]-a["t_ms"] > 250 or "UNAVAILABLE" in (a["left_state"], b["left_state"])]
     return result
 
 

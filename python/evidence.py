@@ -43,8 +43,8 @@ class PublicAblation:
 
 
 def encoders(ablations=False):
-    """Baseline four methods, optionally frozen constituent and category-order controls."""
-    result = dict(METHODS)
+    """Active two-bit experiments, optionally frozen AEEE constituent controls."""
+    result = {name: METHODS[name] for name in ("aeee2", "grayscale2")}
     if ablations:
         protocol = json.loads(PROTOCOL.read_text())
         result.update({"aeee2_no_" + name: PublicAblation(name) for name in protocol["ablations"]})
@@ -278,6 +278,8 @@ def sleepiness_baseline(features, output):
         rows = list(csv.DictReader(stream))
     subjects, videos, digests = {}, set(), set()
     for row in rows:
+        if row["split"] not in ("train", "val", "test"):
+            raise ValueError("Expected frozen train/val/test split")
         if row["label_scope"] != "video" or row["dataset"] != "UTA-RLDD":
             raise ValueError("Use independent UTA-RLDD clip labels, not CNN eye predictions as labels")
         if subjects.setdefault(row["subject_id"], row["split"]) != row["split"]:
@@ -304,7 +306,7 @@ def sleepiness_baseline(features, output):
               "train_mean": mean.tolist(), "train_std": std.tolist(), "centroids": centroids.tolist(),
               "source_sha256": sha256(features), "classes": [0, 5, 10], "aggregation": "whole-clip valid-time indicators",
               "splits": {}}
-    for split in ("val", "test"):
+    for split in ("train", "val", "test"):
         mask = np.array([row["split"] == split for row in rows])
         if not mask.any():
             result["splits"][split] = {"status": "NOT_RUN_DATA_UNAVAILABLE"}
@@ -318,6 +320,33 @@ def sleepiness_baseline(features, output):
         json.dump(result, stream, indent=2, allow_nan=False)
         stream.write("\n")
     return result
+
+
+def classify_clip(row, artifact=None):
+    """Apply an evaluated whole-clip baseline only to registered whole-clip features."""
+    unknown = dict(level="UNKNOWN", scope="whole-clip research classification")
+    if artifact is None or not Path(artifact).is_file():
+        return dict(unknown, reason="Missing fatigue classifier artifact")
+    model = json.loads(Path(artifact).read_text(encoding="utf-8"))
+    if (model.get("status") != "PASS" or model.get("classes") != [0, 5, 10]
+            or model.get("aggregation") != "whole-clip valid-time indicators"
+            or any(model.get("splits", {}).get(s, {}).get("status") != "PASS" for s in ("val", "test"))):
+        return dict(unknown, reason="Whole-clip validation/test evidence unavailable")
+    if row.get("dataset") != "UTA-RLDD" or row.get("label_scope") != "video" or not all(
+            row.get(k) for k in ("subject_id", "source_sha256", "annotation_sha256", "replay_summary_sha256")):
+        return dict(unknown, reason="Requires independently registered whole-clip features")
+    fields = [s + suffix for s in ("left", "right") for suffix in ("_closed_fraction", "_blink_rate")]
+    if model.get("features") != fields:
+        return dict(unknown, reason="Feature contract mismatch")
+    x = np.array([float(row[f]) for f in fields])
+    mean, std, centroids = (np.asarray(model[k], dtype=float) for k in ("train_mean", "train_std", "centroids"))
+    if (mean.shape != (4,) or std.shape != (4,) or centroids.shape != (3, 4)
+            or not all(np.isfinite(a).all() for a in (x, mean, std, centroids)) or np.any(std <= 0)):
+        raise ValueError("Invalid fitted fatigue parameters or observed features")
+    predicted = int((((x-mean)/std-centroids)**2).sum(axis=1).argmin())
+    return dict(level=("ALERT", "LOW_VIGILANCE", "DROWSY")[predicted], scope=unknown["scope"],
+                artifact_sha256=sha256(artifact), validation=model["splits"],
+                limitation="Clip-level research only; not validated for live or 30/60-second prediction")
 
 
 def main(argv=None):
@@ -358,7 +387,18 @@ def main(argv=None):
     sleep = sub.add_parser("sleepiness")
     sleep.add_argument("--features", type=Path, required=True)
     sleep.add_argument("--output", type=Path, required=True)
+    classify = sub.add_parser("classify-clip")
+    classify.add_argument("--features", type=Path, required=True)
+    classify.add_argument("--model", type=Path)
+    classify.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.action == "classify-clip":
+        with args.features.open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        results = [dict(video_id=row.get("video_id"), classification=classify_clip(row, args.model)) for row in rows]
+        with args.output.open("x", encoding="utf-8") as stream:
+            json.dump(results, stream, indent=2, allow_nan=False)
+        return 0
     if args.action == "prepare":
         print(json.dumps(prepare(args.registry, args.output), indent=2))
     elif args.action == "encode":

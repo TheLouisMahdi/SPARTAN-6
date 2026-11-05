@@ -14,7 +14,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 from fpga_host import FPGAClient
 from live_pipeline import EyePipeline, live_cli
-from pretrained_eye import PretrainedEye, read_model, input_pixels, prepare, DIRECTORY
+from pretrained_eye import PretrainedEye, read_model, input_pixels, prepare, DIRECTORY, canonical_logits, fixed_layers, network, OUTPUT_CONTRACT
 
 
 class PretrainedTests(unittest.TestCase):
@@ -65,7 +65,7 @@ class PretrainedTests(unittest.TestCase):
         try:
             result = pipeline.predict(7,1,{"left":roi,"right":roi})
             np.testing.assert_array_equal(result.eyes["left"]["logits"], expected)
-            self.assertEqual(result.eyes["left"]["state"], "OPEN")
+            self.assertEqual(result.eyes["left"]["state"], "CLOSED")
             missing = pipeline.predict(8,2,{"left":roi})
             self.assertEqual(missing.eyes["right"]["state"], "UNAVAILABLE")
         finally:
@@ -88,7 +88,7 @@ class PretrainedTests(unittest.TestCase):
         client.request = request
         roi = np.arange(3072,dtype=np.uint8).reshape(32,32,3)
         result = client.infer_pretrained(roi,roi,9)
-        self.assertEqual(result.left_logits,(-4,8))
+        self.assertEqual(result.left_logits,(8,-4))
         self.assertEqual(result.pair_cycles,200)
         self.assertEqual([struct.unpack_from("<H",p)[0] for k,p in requests[:3]],[0,1024,2048])
         self.assertEqual(b"".join(p[2:] for k,p in requests[:3]),input_pixels(roi).tobytes())
@@ -100,6 +100,30 @@ class PretrainedTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(live_cli(["--status"]),0)
         self.assertIn("open-closed-eye-0001",output.getvalue())
+
+    def test_native_channels_are_canonicalized_only_at_the_host_boundary(self):
+        self.assertEqual(OUTPUT_CONTRACT["native_classes"],["CLOSED","OPEN"])
+        self.assertEqual(OUTPUT_CONTRACT["classes"],["OPEN","CLOSED"])
+        for dtype in (np.float32,np.int32):
+            np.testing.assert_array_equal(canonical_logits(np.array([10,-3],dtype)),[-3,10])
+        roi = np.arange(3072,dtype=np.uint8).reshape(32,32,3)
+        pixels = input_pixels(roi)
+        native_fixed = fixed_layers(pixels,self.model.params,self.model.shifts)[-1]
+        np.testing.assert_array_equal(self.model.predict(roi,fixed=True),native_fixed[[1,0]])
+        raw = network(self.model.raw)
+        raw.setInput(((pixels.astype(np.float32)-127)/255)[None])
+        native_probability = raw.forward().reshape(2)
+        self.assertEqual(int(self.model.predict(roi).argmax()),1-int(native_probability.argmax()))
+
+    def test_rom_reply_and_cpu_reference_use_the_same_canonical_order(self):
+        client = FPGAClient.__new__(FPGAClient)
+        roi = np.arange(3072,dtype=np.uint8).reshape(32,32,3)
+        native = fixed_layers(input_pixels(roi),self.model.params,self.model.shifts)[-1]
+        client.request = lambda kind,payload=b"",sequence=None: (b"\0" if kind == 0x20 else
+            b"\0"+struct.pack("<iiII",int(native[0]),int(native[1]),123,0x4DAA1000),0)
+        result = client.infer_pretrained(roi,roi,1)
+        np.testing.assert_array_equal(result.left_logits,self.model.predict(roi,fixed=True))
+        np.testing.assert_array_equal(result.right_logits,self.model.predict(roi,fixed=True))
 
 
 if __name__ == "__main__":

@@ -1265,7 +1265,7 @@ def hardware_cli(action):
 
 def main():
     """Start the pinned pretrained classifier; archived research remains explicit."""
-    commands = ("live", "model", "fpga", "host", "baseline", "replay", "predict", "capture", "collect", "build", "program",
+    commands = ("live", "compare", "experiment", "dataset", "session-report", "test-all", "model", "fpga", "host", "baseline", "replay", "predict", "capture", "collect", "build", "program",
                 "prepare", "import", "encode", "train", "personal", "ablation", "events", "evidence", "rtl", "pretrained")
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         parser = argparse.ArgumentParser(description=__doc__)
@@ -1274,14 +1274,26 @@ def main():
         print("Use COMMAND --help for that command's options.")
         return 0
     command = sys.argv.pop(1) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "live"
+    if command == "experiment":
+        from experiment import experiment_cli
+        return experiment_cli()
+    if command == "dataset":
+        from public_data import dataset_cli
+        return dataset_cli()
     if command == "pretrained":
         from pretrained_eye import main as pretrained_main
         return pretrained_main()
-    if command in ("live", "model", "host", "fpga"):
+    if command == "session-report":
+        from experiment import report_cli
+        return report_cli()
+    if command == "test-all":
+        from experiment import test_cli
+        return test_cli()
+    if command in ("live", "compare", "model", "host", "fpga"):
         from live_pipeline import live_cli, model_cli
         if command == "model":
             return model_cli()
-        return live_cli(forced_backend={"host": "cpu", "fpga": "fpga"}.get(command))
+        return live_cli(forced_backend={"host": "cpu", "fpga": "fpga", "compare": "compare"}.get(command))
     if command == "evidence":
         from evidence import main as evidence_main
         return evidence_main()

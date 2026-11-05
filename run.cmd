@@ -2,6 +2,5 @@
 setlocal
 cd /d "%~dp0"
 set PYTHONDONTWRITEBYTECODE=1
-if not defined PYTHON set "PYTHON=python"
-"%PYTHON%" -B "%~dp0python\app.py" %*
+"%~dp0assets\runtime\Scripts\python.exe" -B "%~dp0python\app.py" %*
 exit /b %errorlevel%

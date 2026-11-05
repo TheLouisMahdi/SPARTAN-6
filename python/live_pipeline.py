@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import hashlib
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import time
 
@@ -95,6 +96,7 @@ class PairResult:
     eyes: dict
     processing_ms: float
     hardware_cycles: tuple | None = None
+    backends: dict | None = None
 
 
 class EyePipeline:
@@ -207,10 +209,14 @@ def model_cli(argv=None):
         if args.parameters:
             payload = args.parameters.read_bytes()
             read_parameters(payload)
+            try:
+                checkpoint_reference = os.path.relpath(args.parameters.resolve(), args.manifest.resolve().parent)
+            except ValueError:  # Windows paths on different drives.
+                checkpoint_reference = str(args.parameters.resolve())
             record = {"schema_version": 1, "state": "trained", "architecture": "tiny-eye-v1",
                       "input": [1, 16, 32], "classes": ["OPEN", "CLOSED"], "encoder": args.encoder,
                       "encoder_spec": METHODS[args.encoder].SPEC,
-                      "checkpoint": str(args.parameters.resolve()), "sha256": hashlib.sha256(payload).hexdigest(),
+                      "checkpoint": checkpoint_reference, "sha256": hashlib.sha256(payload).hexdigest(),
                       "accuracy": "not established by activation"}
             args.manifest.parent.mkdir(parents=True, exist_ok=True)
             temporary = args.manifest.with_name(args.manifest.name + ".tmp")
@@ -230,13 +236,201 @@ def model_cli(argv=None):
         parser.exit(1, f"MODEL ERROR: {exc}\n")
 
 
+def run_streaming(args, model):
+    """The GUI remains on the caller. All UART activity belongs to eye-fpga."""
+    import csv
+    from dataclasses import asdict
+    import subprocess
+    from uuid import uuid4
+    from queue import Empty, Queue
+    from threading import Event, Thread
+    import cv2
+    from capture import capture_frames, extract_eye_roi, EYE_CORNERS, MODEL_PATH, mp, vision
+    from stream_pipeline import StreamingPipeline, process_rss_bytes, offer_latest
+    from collections import deque
+    from pipeline_report import summarize
+    from experiment import write_json
+    report=args.report
+    if report == ROOT/'assets/logs/live/latest.json':
+        report=ROOT/'assets/runs'/('pipeline_'+args.pipeline+'_'+uuid4().hex[:12])/'session.json'
+    directory=report.parent
+    if report.exists() or (directory/'trace.jsonl').exists() or (directory/'summary.json').exists() or (args.frames and args.frames.exists()):
+        raise FileExistsError('Pipeline outputs must be new; existing reports are preserved')
+    directory.mkdir(parents=True,exist_ok=True)
+    if args.frames: args.frames.parent.mkdir(parents=True,exist_ok=True)
+    trace=(directory/'trace.jsonl').open('x',encoding='utf-8',buffering=65536)
+    replay_rows=[]
+    if args.replay_manifest:
+        from public_data import read_cew_manifest
+        replay_rows=sorted(read_cew_manifest(args.replay_manifest),key=lambda r:r['source_sha256'])[:args.replay_count*2]
+        if len(replay_rows)<args.replay_count*2: raise ValueError('Insufficient registered replay inputs')
+    class Prepare:
+        def __init__(self):
+            self.landmarker=None
+            if not replay_rows:
+                options=vision.FaceLandmarkerOptions(base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH),delegate=mp.tasks.BaseOptions.Delegate.CPU),
+                    running_mode=vision.RunningMode.VIDEO,num_faces=1)
+                self.landmarker=vision.FaceLandmarker.create_from_options(options)
+        def __call__(self,frame,capture_ns):
+            if replay_rows:
+                rois={'left':frame[:,:32], 'right':frame[:,32:]}; boxes={}
+            else:
+                start=time.perf_counter_ns()
+                found=self.landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB,data=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)),capture_ns//1000000)
+                landmark_end=time.perf_counter_ns()
+                rois,boxes={},{}
+                if found.face_landmarks:
+                    for side,corners in EYE_CORNERS.items():
+                        _,box=extract_eye_roi(frame,found.face_landmarks[0],corners)
+                        if box is not None:
+                            x0,y0,x1,y1=box; boxes[side]=box; rois[side]=frame[y0:y1,x0:x1].copy()
+                pipe.record('preparation_components',capture_ns=capture_ns,landmark_start_ns=start,landmark_end_ns=landmark_end,roi_end_ns=time.perf_counter_ns())
+            from pretrained_eye import input_pixels
+            # Identical BGR interpolation is performed before handing work to UART.
+            rois={s:np.ascontiguousarray(input_pixels(roi).transpose(1,2,0)) for s,roi in rois.items()}
+            return rois,boxes
+        def close(self):
+            if self.landmarker is not None: self.landmarker.close()
+    def source(stop):
+        if replay_rows:
+            from experiment import read_color_image
+            from data_tools import sha256
+            pending,errors=Queue(1),Queue(1);ended=Event()
+            def produce():
+                start=time.perf_counter()
+                try:
+                    for i in range(args.replay_count):
+                        if stop.wait(max(0,start+i/args.replay_fps-time.perf_counter())): break
+                        pair=[]
+                        for row in replay_rows[2*i:2*i+2]:
+                            if sha256(Path(row['source_path']))!=row['source_sha256']: raise ValueError('Replay source hash changed')
+                            image,_=read_color_image(row['source_path']); pair.append(cv2.resize(image,(32,32),interpolation=cv2.INTER_LINEAR))
+                        captured=time.perf_counter_ns()
+                        pipe.record('capture',frame_id=i+1,capture_ns=captured,source_ids=[r['sample_id'] for r in replay_rows[2*i:2*i+2]])
+                        old=offer_latest(pending,(i+1,captured,np.concatenate(pair,axis=1)))
+                        if old is not None:pipe.record('dropped_capture',frame_id=old[0],reason='ROI replay latest-frame')
+                except Exception as exc: errors.put_nowait(exc)
+                finally: ended.set()
+            worker=Thread(target=produce,name='roi-source',daemon=True);worker.start()
+            try:
+                while not stop.is_set():
+                    try:yield pending.get(timeout=.05)
+                    except Empty:
+                        if stop.is_set(): break
+                        if ended.is_set():
+                            if not errors.empty():raise errors.get_nowait()
+                            break
+            finally:
+                stop.set();worker.join(3)
+                if worker.is_alive():raise RuntimeError('ROI source did not close')
+                while not pending.empty():pipe.record('dropped_capture',frame_id=pending.get_nowait()[0],reason='shutdown')
+            return
+        pending,errors=Queue(1),Queue(1); stopped=Event()
+        worker=Thread(target=capture_frames,args=(pending,errors,stop,stopped,args.camera,
+            lambda fid,ns:pipe.record('capture',frame_id=fid,capture_ns=ns),
+            lambda fid,reason:pipe.record('dropped_capture',frame_id=fid,reason=reason),time.perf_counter_ns),name='camera-capture',daemon=True)
+        worker.start()
+        try:
+            while not stop.is_set():
+                try: yield pending.get(timeout=.05)
+                except Empty:
+                    if stop.is_set(): break
+                    if stopped.is_set(): raise RuntimeError(errors.get_nowait() if not errors.empty() else 'Camera stopped')
+        finally:
+            stop.set(); worker.join(3)
+            if worker.is_alive(): raise RuntimeError('Camera release did not complete')
+            while not pending.empty(): pipe.record('dropped_capture',frame_id=pending.get_nowait()[0],reason='shutdown')
+    def emit(event): trace.write(json.dumps(event)+'\n')
+    pipe=StreamingPipeline(source,Prepare,lambda:FPGAClient(args.port,baud=args.baud or 1000000),model,
+        mode=args.pipeline,verify=args.verify,emit=emit)
+    meta=dict(schema_version=1,report_kind='stream_pipeline_v1',mode=args.pipeline,source='ROI_REPLAY_ONLY' if replay_rows else 'LIVE_CAMERA_MEDIAPIPE',
+        provenance='PHYSICAL_MEASUREMENT',model_sha256=model.checkpoint_sha256,output_order=['OPEN','CLOSED'],
+        source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
+        dirty_status=subprocess.check_output(['git','status','--short'],cwd=ROOT,text=True),
+        bitstream_sha256_local_artifact=hashlib.sha256((ROOT/'fpga/eye_top.bit').read_bytes()).hexdigest() if (ROOT/'fpga/eye_top.bit').exists() else None,
+        bitstream_provenance='Local artifact hash; reused running firmware must additionally match fingerprint and P2 golden cycles',
+        port=args.port,baud=args.baud or 1000000,camera=None if replay_rows else args.camera,verify=args.verify,
+        warmup_seconds=args.warmup_seconds,start_ns=time.perf_counter_ns(),status='PASS',timing_source='CPU BinocularTimer; onboard diagnostic available through legacy mode',
+        gui=not args.headless,frames_path=str(args.frames or directory/'frames.csv'),images_saved=False,
+        capture_and_stage_clock='time.perf_counter_ns / Windows QPC, monotonic high resolution; legacy capture default unchanged',
+        requested_seconds=args.seconds)
+    meta.update(source_sha256={name:hashlib.sha256((ROOT/'python'/name).read_bytes()).hexdigest()
+        for name in ('live_pipeline.py','stream_pipeline.py','capture.py','fpga_host.py','pretrained_eye.py')},
+        queue_capacities=dict(capture=1,prepared=1,inference=2,display=1),serial_owner='eye-fpga',
+        preparation_owner='eye-prepare',result_owner='eye-result',process_id=__import__('os').getpid())
+    if args.replay_manifest:
+        meta.update(replay_manifest_sha256=hashlib.sha256(args.replay_manifest.read_bytes()).hexdigest(),
+            replay_count=args.replay_count,replay_fps=args.replay_fps,replay_selection='Source SHA256 order; first 2*count eye patches; no label/model-based selection')
+    exit_code=0; first_capture=None; duration_completed=False; ui_polls=0; ui_last=None; ui_max_gap_ms=None
+    memory_samples=deque(maxlen=64);next_memory=0;latest_snapshot=None
+    window='SPARTAN-6 | CPU-FPGA PIPELINE'
+    try:
+        pipe.start()
+        if not args.headless: cv2.namedWindow(window,cv2.WINDOW_NORMAL)
+        while not pipe.done.is_set():
+            pipe.raise_error()
+            observed=time.perf_counter_ns()
+            if observed>=next_memory:
+                memory_samples.append(dict(at_ns=observed,rss_bytes=process_rss_bytes()));next_memory=observed+10_000_000_000
+            if first_capture is None and pipe.first_capture_ns is not None: first_capture=pipe.first_capture_ns
+            if first_capture is not None and args.seconds and (time.perf_counter_ns()-first_capture)/1e9>=args.seconds:
+                duration_completed=True;break
+            if first_capture is None and time.perf_counter_ns()-meta['start_ns']>15e9: raise TimeoutError('No camera/source frame within 15 seconds')
+            try: snapshot=pipe.display.get(timeout=.03)
+            except Empty: snapshot=None
+            if snapshot is not None: latest_snapshot=snapshot
+            if latest_snapshot is not None and not args.headless:
+                snapshot=latest_snapshot
+                item=snapshot.inference.prepared; display=item.frame.copy()
+                expired=time.perf_counter_ns()-item.capture_ns>MAXIMUM_GAP_MS*1000000
+                for side,box in item.boxes.items():
+                    x0,y0,x1,y1=box; cv2.rectangle(display,(x0,y0),(x1,y1),(80,180,180),1)
+                elapsed=max(.001,(time.perf_counter_ns()-(pipe.first_capture_ns or meta['start_ns']))/1e9)
+                kernel=snapshot.inference.hardware.pair_cycles/50000 if snapshot.inference.hardware else None
+                lines=['SPARTAN-6 | CPU-FPGA PIPELINE',f'Backend FPGA P2 | {args.pipeline.upper()} | frame {item.frame_id}',
+                    ' | '.join(s+': '+('UNAVAILABLE' if expired else snapshot.eyes[s]['state']) for s in SIDES),
+                    f'Prep {(item.prep_end_ns-item.prep_start_ns)/1e6:.2f} ms | UART {(snapshot.inference.end_ns-snapshot.inference.start_ns)/1e6:.2f} ms',
+                    f'Age {(time.perf_counter_ns()-item.capture_ns)/1e6:.1f} ms | blinks {snapshot.timing.count}',
+                    f'Capture {pipe.counts.get("capture",0)/elapsed:.1f} FPS | processed {pipe.counts.get("fpga_completed",0)/elapsed:.2f} FPS',
+                    f'Kernel pair {kernel} ms | prep drops {pipe.counts.get("dropped_preparation",0)} | RUNNING {snapshot.reason or ""}']
+                for n,line in enumerate(lines): cv2.putText(display,line,(8,25+22*n),cv2.FONT_HERSHEY_SIMPLEX,.5,(100,235,180),1,cv2.LINE_AA)
+                cv2.imshow(window,display)
+            if not args.headless:
+                ui_now=time.perf_counter_ns();ui_polls+=1
+                if ui_last is not None: ui_max_gap_ms=max(ui_max_gap_ms or 0,(ui_now-ui_last)/1e6)
+                ui_last=ui_now
+                pipe.record('ui_pump',thread_id=__import__('threading').get_ident())
+                if cv2.waitKey(1)&255 in (ord('q'),ord('Q'),27) or cv2.getWindowProperty(window,cv2.WND_PROP_VISIBLE)<1:
+                    if args.seconds: meta['status']='INTERRUPTED';exit_code=130
+                    break
+        pipe.raise_error()
+    except KeyboardInterrupt:
+        meta['status']='INTERRUPTED';exit_code=130
+    except Exception as exc:
+        meta.update(status='FAIL',error=str(exc)); exit_code=1
+    finally:
+        try: pipe.close(); pipe.raise_error()
+        except Exception as exc: meta.update(status='FAIL',shutdown_error=str(exc));exit_code=1
+        meta.update(end_ns=time.perf_counter_ns(),identity=pipe.identity,integrity=pipe.integrity,clean_shutdown=not any(w.is_alive() for w in pipe.threads),
+            completed_requested_duration=duration_completed,ui_poll_count=ui_polls,ui_max_poll_gap_ms=ui_max_gap_ms,
+            ui_thread_id=__import__('threading').get_ident(),memory_samples=list(memory_samples))
+        trace.close()
+        if not args.headless: cv2.destroyAllWindows()
+        write_json(report,meta)
+        summarize(directory,meta,args.frames)
+    print(json.dumps(dict(status=meta['status'],report=str(report),summary=str(directory/'summary.json'))),flush=True)
+    return exit_code
+
+
 def live_cli(argv=None, forced_backend=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, help="Explicit legacy TinyEye manifest; cannot be combined with --network pretrained")
     parser.add_argument("--network", choices=("pretrained", "tiny"), help="Default: pretrained; explicit --manifest selects TinyEye")
     parser.add_argument("--precision", choices=("float", "fixed"), default="float", help="CPU pretrained arithmetic; FPGA always uses fixed")
     parser.add_argument("--baud", type=int, help="Default: 1000000 for pretrained firmware, 115200 for TinyEye")
-    parser.add_argument("--backend", choices=("cpu", "fpga"), default=forced_backend or "cpu")
+    parser.add_argument("--backend", choices=("cpu", "fpga", "compare"), default=forced_backend or "cpu")
+    parser.add_argument("--encoder", choices=("aeee2", "grayscale2"), help="Select an independent TinyEye research model")
+    parser.add_argument("--output", type=Path, help="New experiment session directory")
     parser.add_argument("--workers", type=int, choices=(1, 2), default=2)
     parser.add_argument("--camera", type=int, default=1, help="Integrated Camera on this laptop; choose explicitly if devices change")
     parser.add_argument("--port", default="COM26", help="Opened only with --backend fpga")
@@ -245,7 +439,25 @@ def live_cli(argv=None, forced_backend=None):
     parser.add_argument("--status", action="store_true", help="Show readiness without opening camera or UART")
     parser.add_argument("--report", type=Path, default=ROOT / "assets/logs/live/latest.json")
     parser.add_argument("--frames", type=Path, help="New prediction CSV for offline ocular analysis; never ground-truth labels")
+    parser.add_argument("--pipeline", choices=("sequential", "overlap"), help="Explicit bounded pretrained FPGA stages; omitted preserves the diagnostic baseline")
+    parser.add_argument("--headless", action="store_true", help="No OpenCV windows in an explicit pipeline run")
+    parser.add_argument("--warmup-seconds", type=float, default=3, help="Exclude initial pipeline warmup from throughput statistics")
+    parser.add_argument("--replay-manifest", type=Path, help="Registered CEW manifest for ROI_REPLAY_ONLY, never a camera benchmark")
+    parser.add_argument("--replay-count", type=int, default=20)
+    parser.add_argument("--replay-fps", type=float, default=4, help="Identical host-clock ROI replay pacing for both modes")
     args = parser.parse_args(argv)
+    experiment = args.encoder is not None or args.backend == "compare" or args.output is not None
+    if experiment and not args.encoder:
+        parser.error("Experiment sessions require --encoder aeee2 or grayscale2")
+    if experiment and args.network == "pretrained":
+        parser.error("Research encoders require TinyEye")
+    if experiment:
+        args.network = "tiny"
+        args.manifest = args.manifest or ROOT / "assets/models" / args.encoder / "manifest.json"
+        if args.output is not None and args.output.exists():
+            parser.error("--output must be a new session directory")
+        if args.backend != "cpu" and not args.port.strip():
+            parser.error("A nonempty UART port is required")
     if args.camera < 0 or not np.isfinite(args.seconds) or args.seconds < 0:
         parser.error("Camera must be nonnegative; seconds must be finite and nonnegative")
     if forced_backend and args.backend != forced_backend:
@@ -263,12 +475,22 @@ def live_cli(argv=None, forced_backend=None):
             model = PretrainedEye(precision=args.precision)
         else:
             model = ModelSlot(args.manifest or MODEL_SLOT)
+        if experiment and (not model.ready or model.method != args.encoder):
+            raise ValueError("Trained checkpoint and encoder must match the selected experiment")
     except (OSError, ValueError, KeyError) as exc:
-        parser.exit(1, f"MODEL ERROR: {exc}\n")
+        parser.exit(1, f"{'MODEL_NOT_READY' if experiment else 'MODEL ERROR'}: {exc}\n")
     print(f"MODEL: {model.record['architecture']}; {'ready' if model.ready else 'NOT TRAINED; eye states unavailable'}", flush=True)
     if args.status:
         print(f"BACKEND: {args.backend}; workers={args.workers}; camera/UART not opened")
         return 0
+    if args.pipeline:
+        if not pretrained or args.backend != 'fpga' or experiment:
+            parser.error('--pipeline requires the pretrained FPGA backend')
+        if args.warmup_seconds<0 or not np.isfinite(args.warmup_seconds) or args.replay_count<1 or not np.isfinite(args.replay_fps) or args.replay_fps<=0:
+            parser.error('Invalid pipeline warmup or replay configuration')
+        return run_streaming(args,model)
+    if args.headless or args.replay_manifest:
+        parser.error('--headless/--replay-manifest require an explicit --pipeline')
     if args.backend == "fpga" and not model.ready:
         parser.exit(1, "Train and explicitly activate a model before FPGA inference. No devices opened.\n")
 
@@ -280,11 +502,11 @@ def live_cli(argv=None, forced_backend=None):
 
     pending, errors = Queue(maxsize=1), Queue(maxsize=1)
     stop, stopped = Event(), Event()
-    camera_worker = landmarker = client = pipeline = None
+    camera_worker = landmarker = client = pipeline = session = None
     timer = BinocularTimer()
     frame_stream = writer = None
     frame_origin_ms = None
-    stats = {"schema_version": 1, "backend": args.backend, "workers": args.workers,
+    stats = {"schema_version": 1, "backend": args.backend, "workers": (0 if args.backend == "fpga" else 1) if experiment else args.workers,
              "model_state": model.record["state"], "checkpoint_sha256": model.checkpoint_sha256,
              "encoder": model.method, "camera": args.camera, "verify_cnn_on_cpu": args.verify,
              "architecture": model.record["architecture"],
@@ -303,29 +525,45 @@ def live_cli(argv=None, forced_backend=None):
     window = "Eye pipeline | Q / Esc to quit"
     exit_code = 0
     try:
+        if experiment:
+            from experiment import Session
+            session = Session(args.output, model, args.backend, args.camera, args.port, stats["baud"])
         if args.frames:
             args.frames.parent.mkdir(parents=True, exist_ok=True)
             frame_stream = args.frames.open("x", encoding="utf-8", newline="")
             writer = csv.DictWriter(frame_stream, fieldnames=("frame_id", "timestamp_ms", "left_state", "right_state",
                 "left_open_fraction", "right_open_fraction", "both_event", "both_count", "long_count", "last_duration_ms", "after_read_ms",
-                "fpga_left_cycles", "fpga_right_cycles", "fpga_pair_cycles"))
+                "fpga_left_cycles", "fpga_right_cycles", "fpga_pair_cycles", "validity", "error_reason"))
             writer.writeheader()
-        if args.backend == "fpga":
+        if args.backend in ("fpga", "compare"):
             client = FPGAClient(args.port, baud=stats["baud"]) if pretrained or args.baud else FPGAClient(args.port)
             status = client.ping()
             if not status.get("binocular_timing"):
                 raise RuntimeError("FPGA firmware does not support the existing binocular timer")
-            client.load_model(model)
+            if experiment and status.get("method_id") == 4:
+                raise RuntimeError("TinyEye firmware required; pretrained firmware cannot run research encoders")
+            loaded = client.load_model(model)
+            if experiment:
+                if not loaded.get("model_loaded") or client.read_model() != model_image(model.params):
+                    raise RuntimeError("TinyEye model readback mismatch")
+                session.hardware(loaded)
             client.configure(0, 0)
             client.reset_blinks()
-        pipeline = EyePipeline(model, args.workers, client, args.verify)
+        if experiment:
+            from experiment import ComparisonPipeline
+            pipeline = ComparisonPipeline(model, args.backend, client)
+        else:
+            pipeline = EyePipeline(model, args.workers, client, args.verify)
         options = vision.FaceLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH),
                                              delegate=mp.tasks.BaseOptions.Delegate.CPU),
             running_mode=vision.RunningMode.VIDEO, num_faces=1)
         landmarker = vision.FaceLandmarker.create_from_options(options)
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        camera_worker = Thread(target=capture_frames, args=(pending, errors, stop, stopped, args.camera), daemon=True)
+        capture_args = (pending, errors, stop, stopped, args.camera)
+        if session:
+            capture_args += (session.capture,)
+        camera_worker = Thread(target=capture_frames, args=capture_args, daemon=True)
         camera_worker.start()
         started = last_capture = time.monotonic()
         previous_ms = -1
@@ -361,15 +599,33 @@ def live_cli(argv=None, forced_backend=None):
             # Landmark processing itself can consume the age budget.
             if time.monotonic_ns() - captured_ns > MAXIMUM_GAP_MS * 1_000_000:
                 rois.clear()
-            result = pipeline.predict(frame_id, captured_ns, rois)
+            inference_started = time.perf_counter_ns()
+            try:
+                result = pipeline.predict(frame_id, captured_ns, rois)
+            except Exception as exc:
+                if session:
+                    names = ("cpu", "fpga") if args.backend == "compare" else (args.backend,)
+                    failed = PairResult(frame_id, captured_ns, {}, (time.perf_counter_ns()-inference_started)/1e6,
+                        backends={name: dict(logits=None, error=str(exc)) for name in names})
+                    session.record(failed, [None, None], time.monotonic_ns(), error=str(exc))
+                raise
             if stopped.is_set():
+                if session:
+                    session.record(result, [None, None], time.monotonic_ns(), error="Camera stopped while processing the frame")
                 raise RuntimeError("Camera stopped while processing the frame")
-            timing, scores, now_ns = synchronize_timing(timer, result, client)
+            try:
+                timing, scores, now_ns = synchronize_timing(timer, result, client)
+            except Exception as exc:
+                if session:
+                    session.record(result, [None, None], time.monotonic_ns(), error=str(exc))
+                raise
             age_ms = (now_ns - captured_ns) / 1e6
-            states = ["UNAVAILABLE" if not timing.valid_mask & (1 << index)
+            states = ["UNAVAILABLE" if scores[index] is None or not timing.valid_mask & (1 << index)
                       else "CLOSED" if timing.closed_mask & (1 << index) else "OPEN" for index in range(2)]
             stats["frames"] += 1
-            stats["valid_eye_pairs"] += timing.valid_mask == 3
+            stats["valid_eye_pairs"] += all(score is not None for score in scores) and timing.valid_mask == 3
+            if session:
+                session.record(result, scores, now_ns)
             stats["skipped_capture_frames"] += max(0, frame_id - previous_frame_id - 1)
             previous_frame_id = frame_id
             stats["pair_processing_sum_ms"] += result.processing_ms
@@ -384,7 +640,9 @@ def live_cli(argv=None, forced_backend=None):
             if writer:
                 writer.writerow(dict(frame_id=frame_id, timestamp_ms=captured_ms - frame_origin_ms,
                     left_state=states[0], right_state=states[1], left_open_fraction="", right_open_fraction="",
-                    both_event=int(timing.event), both_count=timing.count, long_count=timing.long_count,
+                    validity="stale" if age_ms > MAXIMUM_GAP_MS else "valid" if all(s is not None for s in scores) else "invalid",
+                    error_reason="expired_at_acceptance" if age_ms > MAXIMUM_GAP_MS else "" if all(s is not None for s in scores) else "incomplete_eye_observation",
+                    both_event=int(timing.event and all(score is not None for score in scores)), both_count=timing.count, long_count=timing.long_count,
                     last_duration_ms=timing.last_duration_ms, after_read_ms=age_ms,
                     **dict(zip(("fpga_left_cycles", "fpga_right_cycles", "fpga_pair_cycles"), result.hardware_cycles or ("", "", "")))))
             display = frame.copy()
@@ -407,7 +665,9 @@ def live_cli(argv=None, forced_backend=None):
             if cv2.waitKey(1) & 0xff in (ord("q"), ord("Q"), 27) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                 break
     except KeyboardInterrupt:
-        pass
+        if experiment:
+            stats["interrupted"] = True
+            exit_code = 130
     except Exception as exc:
         stats["error"] = str(exc)
         print(f"LIVE ERROR: {exc}", flush=True)
@@ -430,6 +690,8 @@ def live_cli(argv=None, forced_backend=None):
                 exit_code = 1
             finally:
                 client.close()
+        if session:
+            session.finish("interrupted" if stats.get("interrupted") else "complete" if exit_code == 0 else "failed", stats.get("error"))
         cv2.destroyAllWindows()
         stats["closures"] = {"total": timer.count if stats["valid_eye_pairs"] else None,
                              "long": timer.long_count if stats["valid_eye_pairs"] else None,

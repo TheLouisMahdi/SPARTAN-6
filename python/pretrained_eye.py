@@ -22,6 +22,20 @@ LICENSE_URL = "https://raw.githubusercontent.com/opencv/openvino_training_extens
 NODES = ("8", "11", "14", "15")
 SHAPES = ((10, 3, 3, 3), (20, 10, 3, 3), (50, 20, 3, 3), (2, 50, 1, 1))
 LAYER_OUTPUTS = ("10", "13", "14", "16")
+# The publisher README reverses the semantics used by its gaze-demo estimator.
+# The pinned graph's native channels are CLOSED, OPEN; public APIs use OPEN, CLOSED.
+NATIVE_CLASSES = ("CLOSED", "OPEN")
+OUTPUT_CONTRACT = {"native_classes": list(NATIVE_CLASSES), "classes": ["OPEN", "CLOSED"],
+                   "canonical_from_native": [1, 0],
+                   "semantics_source": "https://github.com/openvinotoolkit/open_model_zoo/blob/2c9b5c563ab3a202d085a42e2bbfc48f77961f4b/demos/gaze_estimation_demo/cpp/src/eye_state_estimator.cpp"}
+
+
+def canonical_logits(native):
+    """Reorder native ONNX/ROM channels at the host boundary; arithmetic is unchanged."""
+    values = np.asarray(native)
+    if values.shape[-1:] != (2,):
+        raise ValueError("Expected two native pretrained output channels")
+    return values[..., [1, 0]].copy()
 
 
 def read_model(directory=DIRECTORY):
@@ -110,6 +124,7 @@ def prepare(directory=DIRECTORY):
     record = {"architecture": "open-closed-eye-0001", "source": URL, "sha384": CHECKSUM,
               "sha256": hashlib.sha256(raw).hexdigest(), "input": [3, 32, 32],
               "preprocessing": "BGR; (pixel-127)/255; no AEEE", "classes": ["OPEN", "CLOSED"],
+              "output_contract": OUTPUT_CONTRACT,
               "weights": "signed INT16", "activations": "signed INT32", "accumulator": "signed INT48",
               "shifts": shifts, "activation_fractions": fractions, "bounds": bounds,
               "training_performed": False, "calibration_performed": False,
@@ -155,7 +170,7 @@ class PretrainedEye:
         self.raw = read_model(directory)
         self.params, self.shifts, self.fractions, _ = quantized_parameters(self.raw)
         self.precision = precision
-        self.record = {"state": "pretrained", "architecture": "open-closed-eye-0001"}
+        self.record = {"state": "pretrained", "architecture": "open-closed-eye-0001", "output_contract": OUTPUT_CONTRACT}
         self.method, self.ready = "omz_bgr32", True
         self.checkpoint_sha256 = hashlib.sha256(self.raw).hexdigest()
         self.workers = local()
@@ -163,14 +178,14 @@ class PretrainedEye:
     def predict(self, roi, fixed=False):
         pixels = input_pixels(roi)
         if fixed or self.precision == "fixed":
-            return fixed_layers(pixels, self.params, self.shifts)[-1]
+            return canonical_logits(fixed_layers(pixels, self.params, self.shifts)[-1])
         if not hasattr(self.workers, "net"):
             self.workers.net = network(self.raw)
         net = self.workers.net
         net.setInput(((pixels.astype(np.float32)-127) / 255)[None])
         # Pre-softmax scores retain the original decision without pretending
         # Softmax outputs are calibrated probabilities of a real eye state.
-        return net.forward("onnx_node_output_0!16").reshape(2).copy()
+        return canonical_logits(net.forward("onnx_node_output_0!16").reshape(2))
 
 
 def main(argv=None):
@@ -179,13 +194,14 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="New output directory for offline verification")
     parser.add_argument("--pe-count", type=int, choices=(1, 2), default=2)
     parser.add_argument("--baseline-ref", help="Pre-extraction Git revision for verify-uart cycle comparison")
+    parser.add_argument("--offline", action="store_true", help="Verify local weights with deterministic input fixtures; do not download official example images")
     args = parser.parse_args(argv)
     try:
         if args.action in ("verify", "verify-uart"):
             if args.output is None:
                 parser.error("verify requires --output pointing to a new directory")
             from pretrained_verify import verify, verify_uart
-            record = (verify(args.output, args.pe_count) if args.action == "verify" else
+            record = (verify(args.output, args.pe_count, offline=args.offline) if args.action == "verify" else
                       verify_uart(args.output, args.pe_count, baseline_ref=args.baseline_ref))
         else:
             record = prepare() if args.action == "prepare" else json.loads((DIRECTORY / "deployment.json").read_text())

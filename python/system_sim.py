@@ -89,7 +89,7 @@ def simulate_system(output, pe_count=2, baseline_ref=None):
         write_hex(output / "led_expected.hex", led_values)
         (output / "system.vh").write_text(f"`define REQUESTS {len(sizes)}\n`define REQUEST_BYTES {len(requests)}\n`define SYSTEM_PE_COUNT {pe_count}\n`define SYSTEM_PRETRAINED 0\n")
         comparison = baseline_sources(output, baseline_ref)
-        binary = Path(shutil.which("iverilog") or ROOT / "assets/tools/iverilog/ucrt64/bin/iverilog.exe").parent
+        binary = ROOT / "assets/tools/iverilog/ucrt64/bin"
         env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"])
         command = [str(binary / "iverilog.exe"), "-g2001", "-s", "tb_system", "-o", "system.vvp", *comparison,
                    *(str(p.relative_to(output)) for p in sorted((output / "rtl").glob("*.v"))), "tb_system.v"]

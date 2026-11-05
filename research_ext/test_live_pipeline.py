@@ -400,5 +400,196 @@ class PipelineTests(unittest.TestCase):
         task.close.assert_called_once()
 
 
+class StreamingTests(unittest.TestCase):
+    """Deterministic worker contracts; these fake transports are never physical evidence."""
+    def make(self, values=(1,2,3), mode='sequential', block=False, failure=None, missing=None, clock=None):
+        from threading import Event, Lock
+        from stream_pipeline import StreamingPipeline
+        started,release,next_prepared=Event(),Event(),Event()
+        now=[1000000000000]; guard=Lock()
+        def ticks():
+            with guard: now[0]+=1000000; return now[0]
+        clock=clock or ticks
+        events=[]; holder={}; closed=Event()
+        model=SimpleNamespace(checkpoint_sha256='4daa1000'+'0'*56,ready=True,method='omz_bgr32',predict=lambda roi,fixed=True:np.array([int(roi[0,0,0]),255-int(roi[0,0,0])]))
+        class Client:
+            def __init__(self): self.owner=get_ident();self.reader=SimpleNamespace(bad_packets=0);self.timeout_count=self.unmatched_responses=0
+            def check(self):
+                if get_ident()!=self.owner: raise AssertionError('UART used outside its owner')
+            def load_model(self,model):
+                self.check();return dict(method_id=4,model_loaded=True,fingerprint=0 if failure=='firmware' else 0x4daa1000)
+            def configure(self,*args): self.check()
+            def invalidate(self,*args): self.check()
+            def infer_pretrained(self,left,right,frame_id):
+                self.check();started.set()
+                if block and frame_id==1:
+                    if not release.wait(2): raise TimeoutError('Test synchronization deadline')
+                if failure=='timeout': self.timeout_count+=1;raise TimeoutError('Synthetic UART timeout')
+                if failure=='crc': self.reader.bad_packets+=1
+                logits=[tuple(model.predict(roi)) for roi in (left,right)]
+                return HardwareResult(frame_id+1 if failure=='id' else frame_id,4,0,*logits,367739,367739,735478,.1)
+            def close(self): self.check();closed.set()
+        def source(stop):
+            for i,value in enumerate(values,1):
+                if i==2 and block:
+                    if not started.wait(2): raise RuntimeError('FPGA did not start')
+                if failure=='camera': raise RuntimeError('Synthetic camera disconnect')
+                yield i,clock(),np.full((4,4,3),value,np.uint8)
+        def prepare(frame,ns):
+            if failure=='mediapipe': raise RuntimeError('Synthetic MediaPipe failure')
+            if int(frame[0,0,0])==2: next_prepared.set()
+            return ({} if int(frame[0,0,0])==missing else dict(left=frame,right=frame)),{}
+        pipe=StreamingPipeline(source,lambda:prepare,Client,model,mode=mode,verify=True,emit=events.append,clock=clock)
+        return pipe,events,started,release,next_prepared,closed,now
+
+    def finish(self,pipe):
+        self.assertTrue(pipe.done.wait(4),'Pipeline did not finish')
+        pipe.close();pipe.raise_error()
+        self.assertFalse(any(t.is_alive() for t in pipe.threads))
+
+    def test_stream_order_identity_readonly_and_cpu_equality(self):
+        pipe,events,*_=self.make()
+        pipe.start();self.finish(pipe)
+        rows=[e for e in events if e['kind']=='published']
+        self.assertEqual([e['frame_id'] for e in rows],[1,2,3])
+        self.assertEqual([e['raw_logits'][0] for e in rows],[[1,254],[2,253],[3,252]])
+        self.assertEqual(len({e['capture_ns'] for e in rows}),3)
+        self.assertFalse(pipe.display.get().inference.prepared.frame.flags.writeable)
+
+    def test_real_worker_overlap_latest_policy_and_bounded_queues(self):
+        pipe,events,started,release,prepared,closed,_=self.make(tuple(range(1,9)),mode='overlap',block=True)
+        try:
+            pipe.start();self.assertTrue(started.wait(2));self.assertTrue(prepared.wait(2))
+            self.assertTrue(pipe.prep_done.wait(2))
+            self.assertEqual(pipe.prepared.qsize(),1);self.assertEqual(pipe.inferred.maxsize,2)
+            self.assertEqual(pipe.counts['dropped_preparation'],6)
+            self.assertFalse(release.is_set())
+        finally: release.set();self.finish(pipe)
+        self.assertEqual([e['frame_id'] for e in events if e['kind']=='published'],[1,8])
+        self.assertTrue(closed.is_set())
+
+    def test_missing_eyes_never_reuse_previous_logits(self):
+        pipe,events,*_=self.make(missing=2)
+        pipe.start();self.finish(pipe)
+        row=next(e for e in events if e['kind']=='published' and e['frame_id']==2)
+        self.assertIsNone(row['raw_logits']);self.assertEqual(row['eyes']['left']['state'],'UNAVAILABLE')
+
+    def test_failures_propagate_without_cpu_fallback(self):
+        for failure in ('timeout','crc','firmware','id','camera','mediapipe'):
+            with self.subTest(failure=failure):
+                pipe,events,*rest=self.make(failure=failure)
+                pipe.start();self.assertTrue(pipe.done.wait(3));pipe.close()
+                with self.assertRaises(RuntimeError):pipe.raise_error()
+                self.assertEqual(pipe.counts['fpga_completed'],0 if failure in ('timeout','firmware','id','camera','mediapipe') else 1)
+                self.assertTrue(rest[-2].is_set())
+                self.assertFalse(any(t.is_alive() for t in pipe.threads))
+
+    def test_temporal_sequence_matches_existing_timer(self):
+        values=(255,255,0,0,255,255);now=[1000000000000]
+        pipe,events,*_=self.make(values,clock=lambda:now[0])
+        def source(stop):
+            for i,value in enumerate(values):
+                now[0]=1000000000000+i*60000000
+                yield i+1,now[0],np.full((4,4,3),value,np.uint8)
+        pipe.source_factory=source
+        pipe.start();self.finish(pipe)
+        ref=BinocularTimer();expected=[]
+        for i,value in enumerate(values):expected.append(ref.update(float(value==0),float(value==0),(1000000000000+i*60000000)//1000000).count)
+        self.assertEqual([e['blink_count'] for e in events if e['kind']=='published'],expected)
+        self.assertEqual(expected[-1],1)
+
+    def test_stale_result_cannot_publish_old_state_or_blink(self):
+        pipe,events,started,release,prepared,closed,now=self.make((1,),block=True)
+        try:
+            pipe.start();self.assertTrue(started.wait(2));now[0]+=300000000
+        finally: release.set();self.finish(pipe)
+        row=next(e for e in events if e['kind']=='published')
+        self.assertEqual(row['reason'],'stale_result');self.assertEqual(row['eyes']['left']['state'],'UNAVAILABLE');self.assertFalse(row['blink_event'])
+
+    def test_duplicate_frame_rejected(self):
+        pipe,events,*_=self.make()
+        def source(stop):
+            yield 1,pipe.clock(),np.zeros((4,4,3),np.uint8)
+            yield 1,pipe.clock(),np.zeros((4,4,3),np.uint8)
+        pipe.source_factory=source
+        pipe.start();self.assertTrue(pipe.done.wait(3));pipe.close()
+        with self.assertRaisesRegex(RuntimeError,'duplicate_frame'):pipe.raise_error()
+
+    def test_repeat_shutdown_no_worker_gui_calls(self):
+        from threading import Event
+        for _ in range(3):
+            pipe,*_=self.make()
+            with patch('cv2.imshow',side_effect=AssertionError('Worker GUI call')),patch('cv2.waitKey',side_effect=AssertionError('Worker GUI call')):
+                pipe.start();self.finish(pipe)
+            published=pipe.counts['published'];self.assertTrue(pipe.done.is_set());self.assertEqual(pipe.counts['published'],published)
+
+    def test_metric_intersection_and_empty_hardware_not_a_speedup(self):
+        from pipeline_report import intersection,compare
+        self.assertEqual(intersection(0,10,5,15),5);self.assertEqual(intersection(0,3,4,5),0)
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);paths=[]
+            for mode in ('sequential','overlap'):
+                folder=root/mode;folder.mkdir();paths.append(folder)
+                (folder/'summary.json').write_text(json.dumps(dict(pipeline_mode=mode,status='PASS',processed_fps=0,scope='DETERMINISTIC_UNIT_TEST')))
+                (folder/'session.json').write_text(json.dumps(dict(provenance='DETERMINISTIC_UNIT_TEST',source_sha256={})))
+            result=compare(paths,root/'comparison')
+            self.assertEqual(result['status'],'NOT_AVAILABLE');self.assertIsNone(result['throughput_ratio'])
+
+    def test_prepare_and_source_resources_close_on_success_and_failure(self):
+        from threading import Event
+        for failure in (None,'mediapipe'):
+            with self.subTest(failure=failure):
+                pipe,*_=self.make(failure=failure)
+                source_closed,prepare_closed=Event(),Event()
+                original_source=pipe.source_factory; original_prepare=pipe.prepare_factory()
+                def source(stop):
+                    try: yield from original_source(stop)
+                    finally: source_closed.set()
+                class Prepare:
+                    def __call__(self,frame,ns):return original_prepare(frame,ns)
+                    def close(self):prepare_closed.set()
+                pipe.source_factory=source;pipe.prepare_factory=Prepare
+                pipe.start();self.assertTrue(pipe.done.wait(3));pipe.close()
+                if failure:
+                    with self.assertRaises(RuntimeError):pipe.raise_error()
+                else:pipe.raise_error()
+                self.assertTrue(source_closed.is_set());self.assertTrue(prepare_closed.is_set())
+
+    def test_future_capture_is_not_inferred(self):
+        pipe,events,*_=self.make((1,))
+        def source(stop):yield 1,pipe.clock()+500000000,np.zeros((4,4,3),np.uint8)
+        pipe.source_factory=source;pipe.start();self.finish(pipe)
+        row=next(e for e in events if e['kind']=='published')
+        self.assertEqual(row['reason'],'stale_result');self.assertIsNone(row['raw_logits'])
+        self.assertEqual(pipe.counts['submitted'],0)
+
+    def test_result_backpressure_preserves_all_accepted_results(self):
+        from threading import Event
+        pipe,events,*_=self.make(tuple(range(1,6)),mode='overlap')
+        seen={i:Event() for i in range(1,6)};result_started,release=Event(),Event()
+        original_factory=pipe.client_factory
+        def factory():
+            client=original_factory()
+            def infer(left,right,frame_id):
+                client.check();value=int(left[0,0,0]);seen[frame_id].set()
+                return HardwareResult(frame_id,4,0,(value,255-value),(value,255-value),367739,367739,735478,.1)
+            client.infer_pretrained=infer
+            return client
+        def source(stop):
+            for i in range(1,6):
+                if i>1 and not seen[i-1].wait(2):raise RuntimeError('Source/FPGA synchronization timeout')
+                yield i,pipe.clock(),np.full((4,4,3),i,np.uint8)
+        def predict(roi,fixed=True):
+            result_started.set()
+            if not release.wait(2):raise RuntimeError('Result synchronization timeout')
+            value=int(roi[0,0,0]);return np.array([value,255-value])
+        pipe.source_factory=source;pipe.client_factory=factory;pipe.model.predict=predict
+        try:
+            pipe.start();self.assertTrue(result_started.wait(2));self.assertTrue(seen[4].wait(2))
+            self.assertEqual(pipe.inferred.qsize(),2)
+        finally:release.set();self.finish(pipe)
+        self.assertEqual([e['frame_id'] for e in events if e['kind']=='published'],list(range(1,6)))
+
+
 if __name__ == "__main__":
     unittest.main()

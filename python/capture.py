@@ -32,7 +32,7 @@ ROI_SIZE = (32, 16)  # OpenCV width, height.
 CROP_WIDTH_MULTIPLIER = 1.6
 
 
-def capture_frames(pending: Queue, errors: Queue, stop: Event, stopped: Event, camera_index=0):
+def capture_frames(pending: Queue, errors: Queue, stop: Event, stopped: Event, camera_index=0, on_capture=None, on_drop=None, timestamp_clock=None):
     """Own the selected integer camera index; publish the latest frame or a fatal error."""
     camera = None
     try:
@@ -43,18 +43,22 @@ def capture_frames(pending: Queue, errors: Queue, stop: Event, stopped: Event, c
         frame_id = 0
         while not stop.is_set():
             ok, frame = camera.read()
-            capture_timestamp_ns = time.monotonic_ns()
+            capture_timestamp_ns = (timestamp_clock or time.monotonic_ns)()
             if not ok or frame is None or frame.size == 0:
                 raise RuntimeError("Webcam read failed; capture has stopped.")
             if stop.is_set():
                 break
             frame_id += 1
+            if on_capture is not None:
+                on_capture(frame_id, capture_timestamp_ns)
             packet = (frame_id, capture_timestamp_ns, frame)
             try:
                 pending.put_nowait(packet)
             except Full:
                 try:
-                    pending.get_nowait()
+                    discarded = pending.get_nowait()
+                    if on_drop is not None:
+                        on_drop(discarded[0], 'latest_frame')
                 except Empty:
                     pass  # Main may have consumed it since put_nowait failed.
                 # This is the only producer, so the queue cannot refill here.
@@ -104,6 +108,17 @@ def extract_eye_roi(frame: np.ndarray, landmarks, corners: tuple[int, int]):
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     roi = cv2.resize(gray, ROI_SIZE, interpolation=cv2.INTER_AREA)
     return np.ascontiguousarray(roi, dtype=np.uint8), (x0, y0, x1, y1)
+
+
+def color_eye_rois(frame, landmarks):
+    """Reuse canonical eye bounds, retaining original BGR pixels for the OMZ CNN."""
+    rois = {}
+    for side, corners in EYE_CORNERS.items():
+        _, box = extract_eye_roi(frame, landmarks, corners)
+        if box is not None:
+            x0, y0, x1, y1 = box
+            rois[side] = frame[y0:y1, x0:x1].copy()
+    return rois
 
 
 def show_preview(frame, record, boxes, status: str):

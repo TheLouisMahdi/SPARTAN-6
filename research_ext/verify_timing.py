@@ -1,5 +1,4 @@
 """Synthetic temporal traces against the Python reference, RTL simulation or real UART."""
-import shutil
 import argparse
 from dataclasses import asdict
 import json
@@ -65,7 +64,7 @@ def simulate(output, rows):
     (output/"vectors.hex").write_text("".join(f"{v:017x}\n" for v in vectors))
     (output/"expected.hex").write_text("".join(f"{v:066x}\n" for v in expected))
     (output/"suite.vh").write_text(f"`define SAMPLES {len(rows)}\n")
-    binary=Path(shutil.which("iverilog") or ROOT/"assets/tools/iverilog/ucrt64/bin/iverilog.exe").parent
+    binary=ROOT/"assets/tools/iverilog/ucrt64/bin"
     env=dict(os.environ, PATH=str(binary)+os.pathsep+os.environ["PATH"])
     command=[str(binary/"iverilog.exe"),"-g2001","-I",str(output),"-s","tb_timing","-o","bench.vvp",
              str(ROOT/"fpga/rtl/binocular_timer.v"),str(ROOT/"research_ext/tb_timing.v")]
@@ -77,9 +76,9 @@ def simulate(output, rows):
         raise RuntimeError("RTL timing mismatch; see simulation.log")
 
 
-def board(output, rows, port):
+def board(output, rows, port, baud=115200):
     from fpga_host import FPGAClient
-    client=FPGAClient(port)
+    client=FPGAClient(port,baud=baud)
     records=[]
     try:
         status=client.ping()
@@ -104,12 +103,13 @@ def main():
     parser.add_argument("mode",choices=("simulate","board"))
     parser.add_argument("--output",type=Path,required=True)
     parser.add_argument("--port",default="COM26")
+    parser.add_argument("--baud",type=int,default=115200,help="Use 1000000 for the canonical pretrained firmware")
     args=parser.parse_args();output=args.output.resolve();output.mkdir(parents=True,exist_ok=False)
     result=dict(status="FAIL",mode=args.mode,scope="synthetic engineering evidence, not blink-detection accuracy")
     try:
         rows=golden_rows();(output/"goldens.json").write_text(json.dumps(rows,indent=2)+"\n")
         if args.mode=="simulate":simulate(output,rows)
-        else:result.update(board(output,rows,args.port))
+        else:result.update(board(output,rows,args.port,args.baud))
         result.update(status="PASS",cases=len(traces()),samples=len(rows))
     except Exception as exc:
         result["error"]=str(exc)

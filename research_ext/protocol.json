@@ -3,7 +3,7 @@
   "scope": "public licensed subjects only; historical personal runs are excluded",
   "seeds": [42, 43, 44, 45, 46],
   "split_seed": 42,
-  "methods": ["grayscale8", "grayscale2", "sobel2", "aeee2"],
+  "methods": ["aeee2", "grayscale2"],
   "ablations": ["central_band", "adaptive_threshold", "continuity", "orientation", "polarity", "strong_split"],
   "optional_sensitivity": "swap AEEE symbols 2 and 3, train a separate model; never mutate v0.1",
   "epochs": 12,
@@ -16,5 +16,6 @@
   "bootstrap": {"unit": "subject", "resamples": 2000, "seed": 611, "ci": [0.025, 0.975]},
   "perturbations": {"dark": 0.5, "bright": 1.5, "contrast": 0.5, "blur_kernel": [3, 3], "occlusion": "top four ROI rows set to 0"},
   "ocular": {"window_seconds": [30, 60], "max_gap_ms": 250, "blink_ms": [30, 600], "long_closure_ms": 500, "minimum_valid_rate_ms": 30000, "minimum_coverage": 0.8, "perclos80": "null without calibrated aperture provenance; short-blink inclusive"},
+  "indicator": {"version": "experimental-ocular-v1", "window_ms": 60000, "minimum_coverage": 0.8, "minimum_observed_ms": 30000, "moderate_closed_fraction": 0.15, "high_closed_fraction": 0.35, "moderate_closure_ms": 800, "high_closure_ms": 2000, "scope": "Proposed engineering heuristic; no tuning on test labels; not a validated fatigue classifier"},
   "hardware": {"clock_hz": 50000000, "part": "xc6slx9-2ftg256", "pe_counts": [1, 2], "p4": "not implemented until P2 correctness and fit evidence"}
 }

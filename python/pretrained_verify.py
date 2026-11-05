@@ -14,7 +14,7 @@ import numpy as np
 from pretrained_eye import ROOT, PretrainedEye, fixed_layers, input_pixels, network, write_hex, LAYER_OUTPUTS
 
 
-def verify(output, pe_count=2):
+def verify(output, pe_count=2, offline=False):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     model = PretrainedEye()
@@ -23,7 +23,7 @@ def verify(output, pe_count=2):
     rois += [rng.integers(0, 256, (32, 32, 3), np.uint8)]
     names = ["black", "neutral", "white", "synthetic_seed417"]
     public = []
-    for i in range(1, 4):
+    for i in (() if offline else range(1, 4)):
         url = f"https://raw.githubusercontent.com/openvinotoolkit/open_model_zoo/master/models/public/open-closed-eye-0001/assets/{i}.png"
         data = urllib.request.urlopen(url, timeout=45).read()
         path = output / f"official_example_{i}.png"
@@ -54,7 +54,7 @@ def verify(output, pe_count=2):
     for folder in ("rtl", "generated"):
         shutil.copytree(ROOT / "fpga" / folder, output / folder)
     shutil.copy2(ROOT / "research_ext/tb_omz.v", output)
-    binary = Path(shutil.which("iverilog") or ROOT / "assets/tools/iverilog/ucrt64/bin/iverilog.exe").parent
+    binary = ROOT / "assets/tools/iverilog/ucrt64/bin"
     env = dict(os.environ, PATH=str(binary)+os.pathsep+os.environ["PATH"])
     commands = [[str(binary / "iverilog.exe"), "-g2001", "-s", "tb_omz", "-o", "omz.vvp", "rtl/omz_cnn.v", "tb_omz.v"],
                 [str(binary / "vvp.exe"), "omz.vvp"]]
@@ -63,7 +63,7 @@ def verify(output, pe_count=2):
             subprocess.run(command, cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=300)
     log = (output / "simulation.log").read_text()
     result = {"status": "PASS" if "OMZ_PASS" in log and "FAIL" not in log else "FAIL",
-              "scope": "arithmetic equivalence; synthetic and official examples, NOT an accuracy benchmark",
+              "scope": "arithmetic equivalence; deterministic input fixtures, NOT an accuracy benchmark" if offline else "arithmetic equivalence; synthetic and official examples, NOT an accuracy benchmark",
               "pe_count": pe_count, "training_performed": False, "calibration_performed": False,
               "model_sha256": model.checkpoint_sha256, "official_examples": public,
               "comparisons": comparisons, "all_argmax_agree": all(c["argmax_agrees"] for c in comparisons),
@@ -111,7 +111,8 @@ def verify_uart(output, pe_count=2, baseline_ref=None):
         data = input_pixels(roi).tobytes()
         for start in range(0, 3072, 1024):
             add(0x20, struct.pack("<H", start)+data[start:start+1024])
-        add(0x21, response={"logits": model.predict(roi).tolist()})
+        # The packet carries native ROM channels; host inference reorders them.
+        add(0x21, response={"logits": fixed_layers(input_pixels(roi), model.params, model.shifts)[-1].tolist()})
         add(0x21, response=b"\2")  # Cannot reuse the previous eye after inference.
     timer = BinocularTimer()
     for ms, left, right in ((0,0,0),(40,1,1),(100,0,0),(130,1,0),(190,0,0),(220,1,1),(420,1,1),(620,1,1),(820,0,0)):
@@ -126,7 +127,7 @@ def verify_uart(output, pe_count=2, baseline_ref=None):
     (output / "system.vh").write_text(f"`define REQUESTS {len(sizes)}\n`define REQUEST_BYTES {len(packets)}\n`define SYSTEM_PE_COUNT {pe_count}\n`define SYSTEM_PRETRAINED 1\n")
     from rtl_evidence import baseline_sources
     comparison = baseline_sources(output, baseline_ref)
-    binary = Path(shutil.which("iverilog") or ROOT / "assets/tools/iverilog/ucrt64/bin/iverilog.exe").parent
+    binary = ROOT / "assets/tools/iverilog/ucrt64/bin"
     env = dict(os.environ, PATH=str(binary)+os.pathsep+os.environ["PATH"])
     commands = [[str(binary / "iverilog.exe"), "-g2001", "-s", "tb_system", "-o", "uart.vvp", *comparison,
                  *(str(p.relative_to(output)) for p in sorted((output / "rtl").glob("*.v"))), "tb_system.v"],

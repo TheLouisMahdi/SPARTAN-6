@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "state": "untrained",
+  "architecture": "tiny-eye-v1",
+  "input": [1, 16, 32],
+  "classes": ["OPEN", "CLOSED"],
+  "encoder": "aeee2",
+  "checkpoint": null,
+  "sha256": null
+}

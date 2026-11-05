@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import struct
 import time
+from threading import get_ident
 
 import numpy as np
 
@@ -124,6 +125,8 @@ class HardwareResult:
     blink_flags: int = 0
     left_blinks: int | None = None
     right_blinks: int | None = None
+    upload_ms: float | None = None
+    kernel_envelopes: tuple | None = None
 
 
 class FPGAClient:
@@ -133,27 +136,34 @@ class FPGAClient:
         self.timeout = timeout
         self.reader = PacketReader()
         self.sequence = 0
+        self.owner = get_ident()
+        self.request_count = self.timeout_count = self.unmatched_responses = 0
         self.serial.reset_input_buffer()
 
     def close(self):
         self.serial.close()
 
     def request(self, kind, payload=b"", sequence=None):
+        if get_ident() != self.owner:
+            raise RuntimeError("UART requests must remain on the connection owner thread")
         if sequence is None:
             self.sequence = (self.sequence + 1) & 0xFFFFFFFF
             sequence = self.sequence
-        started = time.perf_counter()
+        started = time.perf_counter_ns()
+        self.request_count = getattr(self, "request_count", 0) + 1
         self.serial.write(encode_packet(kind, sequence, payload))
-        deadline = started + self.timeout
-        while time.perf_counter() < deadline:
+        deadline = started + self.timeout * 1_000_000_000
+        while time.perf_counter_ns() < deadline:
             chunk = self.serial.read(max(1, min(self.serial.in_waiting, 2048)))
             for reply_kind, reply_sequence, reply in self.reader.feed(chunk):
                 if reply_kind != kind | 0x80 or reply_sequence != sequence:
+                    self.unmatched_responses = getattr(self, "unmatched_responses", 0) + 1
                     continue
                 if not reply or reply[0] != 0:
                     raise RuntimeError(f"FPGA status error: {reply.hex()}")
-                return reply, (time.perf_counter() - started) * 1000
+                return reply, (time.perf_counter_ns() - started) / 1e6
         self.reader.pending.clear()
+        self.timeout_count = getattr(self, "timeout_count", 0) + 1
         raise TimeoutError(f"No matching FPGA reply for command 0x{kind:02X}, sequence {sequence}")
 
     def ping(self):
@@ -182,23 +192,31 @@ class FPGAClient:
 
     def infer_pretrained(self, left, right, frame_id):
         """Lossless CHW BGR input in three CRC-protected chunks per eye."""
-        from pretrained_eye import input_pixels
+        from pretrained_eye import input_pixels, canonical_logits
         logits, cycles = [], []
-        started = time.perf_counter()
+        started = time.perf_counter_ns()
+        upload_ns = 0
+        envelopes = []
         for roi in (left, right):
             data = input_pixels(roi).tobytes()
+            upload_started = time.perf_counter_ns()
             for offset in range(0, len(data), 1024):
                 self.request(0x20, struct.pack("<H", offset) + data[offset:offset+1024])
+            upload_ns += time.perf_counter_ns() - upload_started
+            command_start = time.perf_counter_ns()
             payload, _ = self.request(0x21)
+            command_end = time.perf_counter_ns()
             if len(payload) != 17:
                 raise RuntimeError("Unexpected pretrained CNN reply length")
-            opened, closed, elapsed, fingerprint = struct.unpack_from("<iiII", payload, 1)
+            native_first, native_second, elapsed, fingerprint = struct.unpack_from("<iiII", payload, 1)
             if fingerprint != 0x4DAA1000:
                 raise RuntimeError("Pretrained CNN fingerprint mismatch")
-            logits.append((opened, closed))
+            logits.append(tuple(int(v) for v in canonical_logits((native_first, native_second))))
             cycles.append(elapsed)
+            envelopes.append((command_start,command_end,elapsed*20))
         return HardwareResult(frame_id, 4, 0, *logits, *cycles, sum(cycles),
-                              (time.perf_counter()-started)*1000)
+                              (time.perf_counter_ns()-started)/1e6, upload_ms=upload_ns/1e6,
+                              kernel_envelopes=tuple(envelopes))
 
     def configure(self, left_threshold=0, right_threshold=0):
         for threshold in (left_threshold, right_threshold):

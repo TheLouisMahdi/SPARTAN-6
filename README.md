@@ -1,74 +1,198 @@
-# SPARTAN-6
+# Spartan-6 pretrained CNN accelerator
 
-Bachelor's electrical engineering project implementing eye-state CNN inference on an ALINX AX309 FPGA, with Python camera acquisition, eye cropping, host inference, UART control and temporal eye-closure analysis. The default network is the pretrained `open-closed-eye-0001`; TinyEye training and AEEE encoding are separate, explicitly selected research paths.
+A Verilog accelerator for the original Open Model Zoo **open-closed-eye-0001**
+eye-state CNN on an **AX309 / Xilinx Spartan-6 XC6SLX9**, clocked at 50 MHz.
+The project studies output-channel parallelism and verifies the complete pretrained
+classifier against independent CPU references. No HLS, retraining or
+data-dependent quantization calibration is used by this path.
 
-## Hardware and environment
+## Architecture and scope
 
-Spartan-6 XC6SLX9-2FTG256, Xilinx ISE 14.7, 50 MHz clock, two parallel processing elements, pretrained CNN enabled, UART 1,000,000 baud. The canonical top is `fpga/rtl/eye_top.v`; `fpga/eye_top.xise` and `board_pins.ucf` define the project and board constraints.
+The CPU captures frames, runs MediaPipe landmarks, extracts BGR eye ROIs and
+prepares 3x32x32 inputs. One UART owner uploads the two eyes sequentially. The
+FPGA performs normalization, all four convolutions, pooling and global MAX.
+The host correlates replies and computes/displays temporal results.
 
-## Processing architecture
+P2 has two output-channel MAC lanes sharing an activation; P1 has one lane.
+This is channel-level parallelism, not simultaneous left/right eyes. The live
+application already has a capture thread and parallel CPU eye workers. FPGA
+requests block their caller in the original diagnostic mode. Compare mode
+overlaps the CPU reference with the same frame's FPGA request, then waits.
 
-Python owns camera capture, MediaPipe facial landmarks, eye ROI extraction and temporal analysis. The CPU reference uses OpenCV FP32. For FPGA inference the host sends BGR 32 x 32 crops through the CRC-protected UART protocol; `command_controller` sequences the CNN and returns scores and timing. The pretrained datapath uses INT16 weights, INT32 activations and INT48 accumulation. No CPU/FPGA concurrency or application accuracy is claimed. TinyEye retains serial/parallel INT8 datapaths, runtime model loading and grayscale/Sobel/AEEE encoders; its shipped model is untrained.
+Explicit `--pipeline sequential` and `--pipeline overlap` modes now share bounded
+preparation, FPGA and result stages. Preparation can run ahead of the serial
+owner; the result stage owns CPU temporal state and the main thread owns OpenCV
+GUI. Traces distinguish request overlap from conservative kernel-overlap bounds.
+See the [architecture and ownership map](docs/REPOSITORY.md) and current
+[acceptance results](docs/VALIDATION_REPORT.md). Full live readiness requires
+valid detected eye pairs; successful ROI replay alone is insufficient.
 
-## Source layout
+**Current status: PARTIALLY_READY.** The physical ROI replay and bounded worker
+pipeline pass; live camera runs and a five-minute runtime test completed, but
+the camera supplied almost-black images and no valid bilateral ROIs. A complete
+live eye-classification demonstration is therefore not yet accepted.
 
-- `fpga/`: canonical ISE project, board constraints, modular RTL, initialized model memories and build/JTAG scripts.
-- `assets/models/eye_model.json`: untrained TinyEye configuration; downloaded models remain local.
-- `python/`: application, capture, references, transport, ocular metrics and research tooling.
-- `research_ext/`: experiment configuration, unit tests and RTL testbenches.
+## Validated results
+
+| Result | Value | Provenance |
+|---|---:|---|
+| P2 CNN cycles per eye | 367,739 / 7.35478 ms at 50 MHz | Physical board cycle counter |
+| P1 / P2 cycles per eye | 731,676 / 367,739; ratio 1.98966 | RTL simulation; P1 not physically benchmarked |
+| CPU/FPGA fixed-point equality | 4,846 CEW images; zero logit differences | Physical UART inference |
+| CEW accuracy / Macro-F1 | 76.228% / 75.753% | Post-inspection evaluation after class-order correction |
+| Laptop FP32 / fixed mean, two eyes | 0.510 / 3.082 ms | Host measurements |
+| FPGA CNN mean, two eyes | 14.70956 ms | Physical cycle counter; excludes UART |
+
+The FPGA is slower than this laptop even before UART transfer. CNN time is not
+camera FPS or end-to-end throughput. CEW static-image results do not establish
+unseen-person generalization or fatigue diagnosis. [Validation details](docs/VALIDATION_REPORT.md)
+separate physical measurements, RTL simulation and implementation reports.
+
+New **ROI_REPLAY_ONLY** comparison (100 identical scheduled pairs at 10 Hz,
+75 inferred pairs per mode): sequential **7.3535 pairs/s**, overlap **7.2615 pairs/s**,
+ratio **0.9875**. This single comparison shows no throughput gain. CPU preparation
+overlapped older FPGA request intervals for **6.9131 ms** in total; the nominal
+50 MHz conservative kernel-overlap lower bound was **0.1753 ms** (MODELLED_ESTIMATE,
+not directly synchronized FPGA timestamps). It excludes camera/MediaPipe work.
+The 300 fresh integer comparisons had zero mismatches; they reuse CEW inputs and
+are compatibility checks, not a new independent recognition evaluation.
+
+## Model and arithmetic
+
+The [publisher model](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/open-closed-eye-0001)
+is retained with its [original license](assets/models/open-closed-eye-0001/LICENSE).
+The 46,164-byte ONNX has SHA256
+`4daa100034482525a26c9afb9297c16580a531189e66e3d2b2ac7d32becfd593`;
+its pinned official SHA384 is enforced before inference/export.
+
+Weights are INT16, activations INT32 and accumulation INT48. Native ONNX/ROM/UART
+channels are **[CLOSED, OPEN]**; application APIs expose **[OPEN, CLOSED]**.
+This correction changes interpretation, not weights or RTL arithmetic. The
+[deployment specification](docs/PRETRAINED_DEPLOYMENT.md) documents layers,
+rounding, protocol, wiring and deterministic ROM generation.
 
 ## Setup
 
-Windows, Python 3.11 and the pinned packages in `requirements.txt` are required. Use an activated environment; `run.cmd` uses `python` on PATH, or the executable in `PYTHON`.
+Use Windows, Python **3.11**, and the pinned dependencies:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-New-Item -ItemType Directory -Force assets/models | Out-Null
+py -3.11 -m venv assets/runtime
+assets/runtime/Scripts/python.exe -m pip install -r requirements.txt
 Invoke-WebRequest 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task' -OutFile assets/models/face_landmarker.task
-.\run.cmd pretrained prepare
-```
-
-Face Landmarker SHA256: `64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`. The pretrained preparation command checks the official ONNX SHA384, regenerates the included fixed-point ROMs/configuration, and fetches its license. Model downloads need network access. See [upstream model metadata](https://github.com/openvinotoolkit/open_model_zoo/blob/master/models/public/open-closed-eye-0001/model.yml), [MediaPipe documentation](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) and `THIRD_PARTY_NOTICES.md`. Original project licensing is unresolved; see `LICENSE`.
-
-## Build and program
-
-Install licensed ISE 14.7 at `C:\Xilinx\14.7\ISE_DS` for the application workflow. Direct `fpga/build.cmd` also accepts `ISE_SETTINGS` pointing to its settings64.bat. Synthesis and implementation use ISE, not Vivado.
-
-```powershell
-.\run.cmd build --network pretrained
-.\run.cmd program
-```
-
-Programming uses Xilinx XSDB/cable transport and an ISE-generated SVF. `XILINX_VIVADO_BIN` can override the default `C:\Xilinx\Vivado\2023.2\bin` for the validated application programming command. Direct `fpga/program.cmd` accepts `XSDB` (default `xsdb.bat` on PATH). A connected XC6SLX9 and working cable server are required. JTAG configuration is volatile. Application programming checks build hashes before programming.
-
-## Application
-
-```powershell
-.\run.cmd live --camera 0
-.\run.cmd fpga --port COM3 --camera 0
 .\run.cmd --help
+.\run.cmd live --status
 ```
 
-Choose the actual camera and serial port. `live` defaults to CPU pretrained inference. Select `--network tiny` explicitly for research, with trained research artifacts; personal data and trained TinyEye checkpoints are not included.
+Launchers use this environment directly. OpenCV DNN runs ONNX; PyTorch remains
+for optional TinyEye research. Offline RTL checks use the tested Icarus Verilog
+13.0 Windows distribution under `assets/tools/iverilog/ucrt64/` (keep its `bin/`
+and `lib/` layout). Pretrained verification currently uses that explicit path;
+installing executables on PATH alone is insufficient for those commands.
+Implementation requires Xilinx **ISE 14.7** for the target. Programming uses
+the existing Vivado/XSDB SVF workflow and a compatible JTAG cable. See the
+[operating guide](guid.md). Camera modes require the local
+`assets/models/face_landmarker.task` asset. It is downloaded separately and is not
+redistributed in the source release. Expected SHA256:
+`64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`.
 
-## Verification
-
-Install Icarus Verilog with `iverilog.exe` and `vvp.exe` on PATH. Run setup first. Output directories below must be new.
+## Verification without a board
 
 ```powershell
-python -B -m unittest discover -s research_ext -p 'test_*.py'
-.\run.cmd pretrained verify --output assets/runs/omz_check
-.\run.cmd pretrained verify-uart --output assets/runs/uart_check
-.\run.cmd rtl system --output assets/runs/system_check
-python -B research_ext/verify_timing.py simulate --output assets/runs/timing_check
+assets/runtime/Scripts/python.exe -m compileall -q python
+.\test_all.bat
+.\run.cmd pretrained status
+.\run.cmd pretrained verify --offline --pe-count 1 --output assets/runs/p1_new
+.\run.cmd pretrained verify --offline --pe-count 2 --output assets/runs/p2_new
 ```
 
-## Verified limitations
+Use a new output directory for every run. `test_all.bat` runs Python, CNN arithmetic,
+pin-level UART/controller and temporal RTL regressions without contacting a board.
+CPU camera demonstration: `.\run.cmd live --precision fixed`. FP32 remains the
+default; camera demonstrations are not accuracy measurements.
 
-Publication checks: 66 unit tests completed (65 passed, one skipped) in the pinned runtime; all 18 application modules imported. Pretrained arithmetic, pretrained and TinyEye UART simulations passed. Timing simulation passed 18 cases / 91 samples. XISE dependencies and UCF port references were checked. Model regeneration reproduced the shipped files byte for byte.
+## Streaming demonstration and reports
 
-Clean ISE 14.7 synthesis and implementation completed: 4,176 LUTs, 2,745 registers, 29 RAMB16BWERs and 10 DSP48A1s. Post-route analysis met the 20 ns clock constraint with a 19.431 ns minimum period (51.464 MHz), zero setup/hold timing errors. This validates the declared constraints; external I/O timing budgets are not specified in the UCF.
+The validated workstation used camera 1 and the board-associated CP210x at COM26.
+Select the corresponding camera/known board port on another machine. Give every
+experiment a new output directory; do not overwrite previous runs.
 
-Camera/board end-to-end operation, recognition accuracy on users, clinical validity and physical timing have not been verified for this publication. Simulation, ISE implementation and physical operation are separate checks. No datasets, recordings, environments, bitstreams or build reports are distributed. Historical Git-baseline comparison requires a separately supplied prior revision; the clean source release contains no earlier history. Research reproduction requires separately licensed datasets and training runs.
+```powershell
+$tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+.\run.cmd live --camera 1 --seconds 5 --report "assets/runs/cpu_demo_$tag/session.json"
+.\run.cmd fpga --pipeline sequential --port COM26 --camera 1 --seconds 63 --warmup-seconds 3 --report "assets/runs/sequential_$tag/session.json"
+.\run.cmd fpga --pipeline overlap --port COM26 --camera 1 --seconds 63 --warmup-seconds 3 --report "assets/runs/overlap_$tag/session.json"
+```
+
+`--headless` disables all window calls in explicit pipeline modes. `--verify`
+compares returned logits on the CPU; use it for correctness, not primary timing.
+The default command without `--pipeline` retains the synchronous hardware-timer
+diagnostic behavior. Streaming mode labels its CPU temporal source explicitly.
+
+The same bounded pipeline can replay a registered CEW source at identical pacing:
+
+```powershell
+.\run.cmd fpga --pipeline overlap --port COM26 --headless --warmup-seconds 0 --replay-manifest assets/datasets/cew/manifest.csv --replay-count 100 --replay-fps 10 --report "assets/runs/roi_overlap_$tag/session.json"
+.\run.cmd experiment pipeline-compare --runs "assets/runs/sequential_$tag" "assets/runs/overlap_$tag" --output "assets/runs/comparison_$tag"
+.\run.cmd session-report "assets/runs/overlap_$tag"
+Start-Process "assets/runs/overlap_$tag/report.html"
+```
+
+A comparison without completed CNN samples returns NOT_AVAILABLE, never a
+zero-sample hardware speedup. Each pipeline run records original IDs, capture and
+stage timestamps, drops, kernel cycles, serial integrity, memory samples and a
+real timestamp timeline in `trace.jsonl`, `frames.csv`, `session.json`,
+`summary.json` and `report.html`. ROI replay is labelled ROI_REPLAY_ONLY;
+capture-source drops and preparation drops are reported separately. The report
+denominator includes drain/clean shutdown, excludes the declared warmup and
+does not confuse capture FPS with successful inference FPS.
+
+## Build, program and physical checks
+
+```powershell
+.\run.cmd pretrained prepare
+.\run.cmd build --network pretrained --pe-count 2
+# Explicit hardware operations, only when programming/testing is intended:
+.\run.cmd program
+.\run.cmd experiment golden --mode compare --port COM3 --output assets/runs/board_goldens_new
+.\run.cmd fpga --port COM3
+```
+
+Replace COM3 with the known board port. `prepare` verifies/downloads the original
+weights and regenerates coefficients. The sole canonical ISE project is
+`fpga/eye_top.xise`: PRETRAINED=1, PE_COUNT=2, 50 MHz, 1,000,000 baud.
+Build checks timing and artifact hashes; program validates the selected build
+before volatile JTAG configuration. FPGA tests require the matching build.
+Do not program an archived bitstream solely because an old report says PASS.
+
+CEW and authorized video experiments require locally acquired data and explicit
+registration. See [dataset setup](docs/DATASET_SETUP.md); images, private recordings,
+environments and raw experimental reports are excluded from Git.
+
+## Repository
+
+| Directory | Role |
+|---|---|
+| `fpga/rtl/`, `fpga/generated/` | RTL and required coefficient ROMs |
+| `fpga/` scripts, project, UCF | Build/program workflow and constraints |
+| `python/` | Application, CPU references, UART host and experiments/reports |
+| `research_ext/` | Regression tests, RTL benches and research protocol |
+| `docs/`, `guid.md`, `REPO_MAP.md` | Specifications, operating guide and navigation |
+| `assets/models/` | Pinned model, license and explicit research manifests |
+| other `assets/` content | Local-only data, tools, environments and evidence |
+
+AEEE2, grayscale/Sobel encoders and TinyEye remain **optional research**, separate
+from the validated pretrained path. Their model slots remain untrained until
+a valid checkpoint is supplied. See [research protocol](docs/RESEARCH_PROTOCOL.md).
+
+## Limitations and credits
+
+Binary eye scores are not calibrated aperture/PERCLOS80 measurements. Sparse
+observations and UART latency can miss fast closures. The ocular indicator is
+an unvalidated engineering heuristic, not a clinical fatigue diagnosis. No
+power result or future pipeline speedup is claimed.
+
+Credit belongs to Open Model Zoo/OpenVINO for the pretrained CNN, MediaPipe for
+landmarks, and the CEW authors for the separately acquired evaluation data.
+Preserve the bundled license and respect dataset redistribution terms.
+No project-wide source-code license has yet been declared; third-party licenses
+do not license this repository's own code. [Third-party details](docs/THIRD_PARTY.md).

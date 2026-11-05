@@ -169,11 +169,11 @@ def simulate(output, ise=Path(r"C:\Xilinx\14.7\ISE_DS"), simulator="iverilog",
         try:
             if simulator == "iverilog":
                 with (output / "simulation.log").open("w") as log:
-                    process = subprocess.run(command, cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=300)
+                    process = subprocess.run(command, cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=600)
             else:
                 process = subprocess.run(command, cwd=output, timeout=180)
         except subprocess.TimeoutExpired:
-            result.update(status="NOT_RUN_MISSING_DEPENDENCY", reason="Simulator executable did not complete; see compile/simulation logs")
+            result.update(status="FAIL_TIMEOUT", reason="Simulator exceeded its bounded runtime; see compile/simulation logs")
             (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             return result
         log = (output / "simulation.log").read_text(errors="replace") if (output / "simulation.log").exists() else ""
@@ -416,7 +416,7 @@ def program_svf(svf, output):
     if not svf.is_file():
         raise FileNotFoundError(svf)
     output.mkdir(parents=True, exist_ok=False)
-    driver = Path(os.environ.get("XILINX_VIVADO_BIN", r"C:\Xilinx\Vivado\2023.2\bin"))
+    driver = Path(r"C:\Xilinx\Vivado\2023.2\bin")
     # This is the already installed JTAG driver/XSDB transport, not a Spartan-6
     # synthesis backend. All BIT/SVF generation is ISE 14.7.
     try:

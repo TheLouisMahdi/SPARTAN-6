@@ -11,6 +11,9 @@ import numpy as np
 from data_tools import sha256, source_subjects, import_subject, LABELS
 
 DATASETS = {"RTBENE", "MRL", "UTA-RLDD", "DROZY"}
+CEW_URL = "https://parnec.nuaa.edu.cn/_upload/tpl/02/db/731/template731/pages/xtan/ClosedEyeDatabases.html"
+CEW_FIELDS = ("sample_id", "source_path", "source_sha256", "label", "source_type", "subject_id", "label_provenance")
+CEW_TYPES = ("eye_patch", "face_original", "face_warped")
 FIELDS = ("sample_id", "subject_id", "session_id", "frame_group", "eye_side", "label", "roi_path",
           "source_dataset", "roi_policy", "split", "canonical_sha256", "label_scope")
 
@@ -49,6 +52,112 @@ def write_csv(path, rows, fields):
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def register_cew(source, output, provenance=None, annotations=None):
+    """Register an authorized extracted copy using publisher labels verified by its owner.
+
+    The official download requires sign-in here; undocumented folder names are
+    never guessed. Supply explicit label_directories in raw/provenance.json or
+    an independently verified annotation CSV.
+    """
+    source, output = Path(source).resolve(), Path(output).resolve()
+    if not source.is_dir():
+        raise FileNotFoundError("DATA_NOT_AVAILABLE: obtain and extract the official CEW archive locally")
+    provenance = Path(provenance) if provenance else source/"provenance.json"
+    record = json.loads(provenance.read_text(encoding="utf-8-sig"))
+    if (record.get("approved_local_use") is not True or record.get("source_url") != CEW_URL
+            or not record.get("rights_note") or not record.get("label_provenance")):
+        raise ValueError("CEW requires approved local research use, official source URL and verified label provenance")
+    if output.exists() or (output.parent/"provenance.json").exists():
+        raise FileExistsError("Registration output/provenance already exists; choose a new output directory")
+    explicit = None
+    if annotations:
+        with Path(annotations).open(newline="", encoding="utf-8-sig") as stream:
+            annotated = list(csv.DictReader(stream))
+        explicit = {}
+        for row in annotated:
+            path = (source/row["source_path"]).resolve()
+            if path in explicit or not path.is_relative_to(source):
+                raise ValueError("Duplicate or unsafe annotation path")
+            explicit[path] = row
+    mapping = record.get("label_directories", {})
+    if explicit is None and not mapping:
+        raise ValueError("Verify publisher label folders in label_directories or supply --annotations; labels are never inferred")
+    directories = []
+    for name, spec in mapping.items():
+        folder = (source/name).resolve()
+        if not folder.is_relative_to(source) or not folder.is_dir() or not isinstance(spec, dict):
+            raise ValueError("Unsafe/missing verified CEW class directory")
+        directories.append((folder, spec))
+    images = sorted(p for p in source.rglob("*") if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".pgm", ".tif", ".tiff"))
+    if not images:
+        raise ValueError("DATA_NOT_AVAILABLE: no extracted CEW images")
+    rows, seen = [], {}
+    for path in images:
+        path = path.resolve()
+        matches = [explicit[path]] if explicit is not None and path in explicit else [] if explicit is not None else [spec for folder,spec in directories if path.is_relative_to(folder)]
+        if len(matches) != 1:
+            raise ValueError(f"Ambiguous/missing independent CEW label: {path}")
+        spec = matches[0]
+        if spec.get("label") not in ("OPEN", "CLOSED") or spec.get("source_type") not in CEW_TYPES:
+            raise ValueError("CEW labels must be OPEN/CLOSED with explicit eye_patch/face_original/face_warped source_type")
+        digest = sha256(path)
+        if digest in seen:
+            raise ValueError(f"Exact duplicate CEW image: {path} and {seen[digest]}")
+        seen[digest] = path
+        rows.append(dict(sample_id="cew_"+digest[:20], source_path=str(path), source_sha256=digest,
+            label=spec["label"], source_type=spec["source_type"], subject_id=spec.get("subject_id", ""),
+            label_provenance=record["label_provenance"]))
+    if explicit is not None and set(explicit) != {Path(r["source_path"]) for r in rows}:
+        raise ValueError("Annotation CSV and extracted image inventory differ")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_csv(output, rows, CEW_FIELDS)
+    result = dict(record, schema_version=1, dataset="CEW", source_root=str(source), source_provenance_sha256=sha256(provenance),
+        manifest_sha256=sha256(output), registered_samples=len(rows), subject_metadata="Unknown unless explicitly provided; filenames are not subject identities",
+        annotations_sha256=sha256(annotations) if annotations else None)
+    with (output.parent/"provenance.json").open("x", encoding="utf-8") as stream:
+        json.dump(result, stream, indent=2)
+    return result
+
+
+def read_cew_manifest(path):
+    path = Path(path)
+    with path.open(newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream)
+        if not set(CEW_FIELDS).issubset(reader.fieldnames or []):
+            raise ValueError("Missing CEW manifest columns")
+        rows = list(reader)
+    if not rows:
+        raise ValueError("DATA_NOT_AVAILABLE: empty CEW manifest")
+    ids, hashes = set(), set()
+    for row in rows:
+        if (not row["sample_id"] or row["sample_id"] in ids or row["source_sha256"] in hashes
+                or row["label"] not in ("OPEN", "CLOSED") or row["source_type"] not in CEW_TYPES
+                or not row["source_path"] or not row["label_provenance"]
+                or len(row["source_sha256"]) != 64 or any(c not in "0123456789abcdef" for c in row["source_sha256"])):
+            raise ValueError("Invalid/ambiguous CEW labels, source type, hash or duplicate sample")
+        ids.add(row["sample_id"])
+        hashes.add(row["source_sha256"])
+        row["source_path"] = str((path.parent/row["source_path"]).resolve())
+    return rows
+
+
+def dataset_cli(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description="Register authorized local datasets without downloading or modifying images")
+    sub = parser.add_subparsers(dest="action", required=True)
+    cew = sub.add_parser("register-cew")
+    cew.add_argument("--input", type=Path, required=True)
+    cew.add_argument("--output", type=Path, required=True)
+    cew.add_argument("--provenance", type=Path, help="Default: INPUT/provenance.json; verified rights and publisher label mapping")
+    cew.add_argument("--annotations", type=Path, help="Explicit verified source_path,label,source_type,subject_id CSV")
+    args = parser.parse_args(argv)
+    try:
+        print(json.dumps(register_cew(args.input, args.output, args.provenance, args.annotations), indent=2))
+        return 0
+    except (OSError, ValueError, KeyError) as exc:
+        parser.exit(1, f"{'DATA_NOT_AVAILABLE' if isinstance(exc, FileNotFoundError) else 'FAIL'}: {exc}\n")
 
 
 def subject_splits(subjects, seed=42):

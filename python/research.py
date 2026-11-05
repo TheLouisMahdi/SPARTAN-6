@@ -317,7 +317,7 @@ def train_cli():
     parser.add_argument("--encoded", type=Path, default=Path(ASSETS / "data/encoded/v1"))
     parser.add_argument("--output", type=Path, default=Path(ASSETS / "runs/phase4_v1"))
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
-    parser.add_argument("--methods", nargs="+", choices=tuple(METHODS), default=list(METHODS),
+    parser.add_argument("--methods", nargs="+", choices=tuple(METHODS), default=["aeee2", "grayscale2"],
                         help="Fit/evaluate any path independently, using its own output directory")
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=1024)
