@@ -11,6 +11,7 @@ import struct
 import subprocess
 import threading
 import time
+from bounded_log import BoundedLog
 
 ROOT = Path(__file__).resolve().parents[1]
 XSDB = Path(r"C:\Xilinx\Vivado\2023.2\bin\xsdb.bat")
@@ -57,14 +58,14 @@ class JtagSession:
         self.closed = False
         self.programming = program_probe_svf is not None
         self.lines = queue.Queue(maxsize=128)
-        self.log = Path(log_path).open("x", encoding="utf-8")
+        self.log = BoundedLog(log_path)
         mode = ["experimental-probe"]
         if program_probe_svf is not None:
             path = Path(program_probe_svf).resolve()
             if not path.is_file():
                 self.log.close()
                 raise FileNotFoundError(path)
-            if expected_usercode not in (0x4a544731, 0x4a544e31):
+            if expected_usercode not in (0x4a544731, 0x4a544e31, 0x4a545931):
                 self.log.close()
                 raise ValueError("unsupported experimental image")
             mode = ["program-probe", str(path), str(expected_usercode)]
@@ -74,22 +75,29 @@ class JtagSession:
                     self.log.close()
                     raise FileNotFoundError(rollback)
                 mode.append(str(rollback))
-        self.process = subprocess.Popen([os.environ["COMSPEC"], "/d", "/c", str(XSDB),
-            str(ROOT/"fpga/jtag_stream.tcl"), *mode], cwd=ROOT,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW)
+        try:
+            self.process = subprocess.Popen([os.environ["COMSPEC"], "/d", "/c", str(XSDB),
+                str(ROOT/"fpga/jtag_stream.tcl"), *mode], cwd=ROOT,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW)
+        except BaseException:
+            self.log.close()
+            raise
         def read():
-            for line in self.process.stdout:
-                self.log.write(line)
-                self.log.flush()
-                self.lines.put(line.rstrip("\r\n"))
-            self.lines.put(None)
+            try:
+                for line in self.process.stdout:
+                    self.log.write(line)
+                    self.lines.put(line.rstrip("\r\n"))
+            except Exception as exc:
+                self.lines.put("JTERROR\t0\t"+str(exc).encode("utf-8").hex())
+            finally:
+                self.lines.put(None)
         self.reader = threading.Thread(target=read, name="xsdb-output", daemon=True)
         self.reader.start()
         try:
             ready = self._receive("JTREADY", startup=True, programming=program_probe_svf is not None)
             self.frequency = int(ready[1])
-        except Exception as exc:
+        except BaseException as exc:
             self.log.write(f"HOST_STARTUP_ERROR {exc!r}\n")
             self.close()
             raise
@@ -141,6 +149,15 @@ class JtagSession:
                 "build_ms": int(fields[2])/1000, "execute_ms": int(fields[3])/1000,
                 "format_ms": int(fields[4])/1000, "tck": self.frequency,
                 "shift_bits": len(data)*8*repeat}
+
+    def exchange_eye(self, packet):
+        if len(packet) != 198:
+            raise ValueError("compound exchange requires one compact 198-byte eye")
+        started = time.perf_counter_ns()
+        fields = self._request("EYE", "JTEYE", packet.hex())
+        return dict(data=bytes.fromhex(fields[5]), wall_ms=(time.perf_counter_ns()-started)/1e6,
+                    upload_ms=int(fields[2])/1000, poll_count=int(fields[3]),
+                    exchange_ms=int(fields[4])/1000, upload_provenance="XSDB Tcl upload interval")
 
     def transact(self, sequence, payload, command=1, capture=False):
         packet = probe_packet(sequence, payload, command)
@@ -206,6 +223,17 @@ def parse_cnn_reply(data):
 
 class JtagCNNClient:
     """One outstanding eye; frame metadata is checked against actual TDO fields."""
+    payload_size = 3089
+    expected_cycles = 367739
+    make_packet = staticmethod(cnn_packet)
+    parse_response = staticmethod(parse_cnn_reply)
+    reverse_logits = True
+
+    def _upload_scan(self, packet, capture):
+        return self.session.scan(packet, capture)
+
+    def _poll_scan(self):
+        return self.session.scan(bytes(CNN_REPLY.size))
     def __init__(self,session,capture_payload=False):
         self.owner=threading.get_ident()
         if getattr(session,"owner",self.owner)!=self.owner:
@@ -224,14 +252,14 @@ class JtagCNNClient:
         if self.pending is not None:
             raise RuntimeError("one outstanding JTAG eye credit")
         next_sequence=(self.sequence+1)&0xffffffff
-        packet=cnn_packet(next_sequence,frame_id,capture_ns,eye,pixels)
+        packet=self.make_packet(next_sequence,frame_id,capture_ns,eye,pixels)
         self.sequence=next_sequence
         body=packet[CNN_REPLY.size:-1]
         self.pending=dict(sequence=self.sequence,frame_id=frame_id,capture_ns=capture_ns,eye=eye,
                           crc=binascii.crc_hqx(body[:-2],0xffff),started=time.perf_counter_ns())
         self.request_count+=1
         try:
-            measured=self.session.scan(packet,self.capture_payload)
+            measured=self._upload_scan(packet,self.capture_payload)
             if self.capture_payload:
                 recovered=((int.from_bytes(measured["data"],"little")>>(CNN_REPLY.size*8+1))&((1<<(len(body)*8))-1)).to_bytes(len(body),"little")
                 if recovered!=body:raise ValueError("CNN input echo mismatch")
@@ -249,12 +277,12 @@ class JtagCNNClient:
         polls=[]
         try:
             while time.perf_counter()<deadline:
-                measured=self.session.scan(bytes(CNN_REPLY.size))
+                measured=self._poll_scan()
                 polls.append({k:v for k,v in measured.items() if k!="data"})
-                reply=parse_cnn_reply(measured["data"])
+                reply=self.parse_response(measured["data"])
                 if reply["size"]==0 and reply["status"] in (8,9):
                     continue # BOOT/BUSY snapshots have no accepted request identity.
-                if reply["sequence"]!=expected["sequence"] or reply["size"]!=3089:
+                if reply["sequence"]!=expected["sequence"] or reply["size"]!=self.payload_size:
                     self.sequence_errors+=1
                     raise ValueError("stale, missing or out-of-order CNN response")
                 if reply["crc"]!=expected["crc"]:
@@ -266,8 +294,9 @@ class JtagCNNClient:
                     raise RuntimeError(f"explicit JTAG CNN status {reply['status']} sequence {reply['sequence']}")
                 for field in ("frame_id","capture_ns","eye"):
                     if reply[field]!=expected[field]:raise ValueError(f"CNN {field} association mismatch")
-                if reply["cycles"]!=367739:raise ValueError("CNN baseline cycle count changed")
-                reply.update(logits=tuple(reversed(reply["native_logits"])),polls=polls,
+                if self.expected_cycles is not None and reply["cycles"]!=self.expected_cycles:raise ValueError("CNN baseline cycle count changed")
+                if reply["cycles"]<=0:raise ValueError("missing CNN cycle measurement")
+                reply.update(logits=tuple(reversed(reply["native_logits"])) if self.reverse_logits else reply["native_logits"],polls=polls,
                              wall_ms=(time.perf_counter_ns()-expected["started"])/1e6)
                 return reply
             self.timeouts+=1

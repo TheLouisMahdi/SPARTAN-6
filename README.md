@@ -1,4 +1,18 @@
-# Spartan-6 pretrained CNN accelerator
+# SPARTAN-6 Compact Eye NPU
+
+An electrical-engineering graduation project for the AX309 / XC6SLX9.
+The physically validated pretrained implementation below remains the reference.
+A trained TinyEye P2 alternative has passed physical inference checks on
+registered inputs. Real webcam acceptance remains user initiated and untested.
+See [compact implementation and acceptance gates](docs/COMPACT_EYE_NPU.md).
+
+```powershell
+.\run.cmd demo --check
+```
+
+This command checks deployment prerequisites without opening a camera or
+programming hardware. It can read device identity. Normal `demo` starts only with registered, verified
+firmware, model, and rollback artifacts. Real camera acceptance is pending.
 
 A Verilog accelerator for the original Open Model Zoo **open-closed-eye-0001**
 eye-state CNN on an **AX309 / Xilinx Spartan-6 XC6SLX9**, clocked at 50 MHz.

@@ -1,4 +1,4 @@
-"""Bounded pretrained stages. UART belongs exclusively to the inference thread.
+"""Bounded eye stages. The transport belongs exclusively to the inference thread.
 
 No GUI, device discovery or device opening occurs on import. Temporal state is
 owned by the result thread; hardware-timer diagnostics remain in live_pipeline.
@@ -88,13 +88,17 @@ class StreamingPipeline:
     stages with a completion barrier before accepting the next source frame.
     """
     def __init__(self, source_factory, prepare_factory, client_factory, model,
-                 mode='overlap', verify=False, emit=None, clock=time.perf_counter_ns):
+                 mode='overlap', verify=False, emit=None, clock=time.perf_counter_ns, startup_timeout=5, prepared_capacity=1):
         if mode not in ('sequential', 'overlap'):
             raise ValueError('Unknown pipeline mode')
+        if prepared_capacity not in (1,2,3,4):
+            raise ValueError('Prepared queue must remain bounded to 1..4 frames')
         self.source_factory, self.prepare_factory = source_factory, prepare_factory
         self.client_factory, self.model = client_factory, model
+        self.pretrained = model.method == 'omz_bgr32'
         self.mode, self.verify, self.clock = mode, verify, clock
-        self.prepared, self.inferred, self.display = Queue(1), Queue(2), Queue(1)
+        self.startup_timeout = startup_timeout
+        self.prepared, self.inferred, self.display = Queue(prepared_capacity), Queue(2), Queue(1)
         self.errors = Queue(1)
         self.stop, self.abort = Event(), Event()
         self.prep_done, self.fpga_done, self.done, self.ready = Event(), Event(), Event(), Event()
@@ -139,7 +143,10 @@ class StreamingPipeline:
         prepare = source = None
         previous_id = previous_ns = 0
         try:
-            if not self.ready.wait(5): raise TimeoutError('FPGA startup did not complete')
+            deadline = time.monotonic()+self.startup_timeout
+            while not self.ready.wait(.05):
+                if self.stop.is_set(): return
+                if time.monotonic()>=deadline: raise TimeoutError('FPGA startup did not complete')
             if self.abort.is_set(): return
             prepare = self.prepare_factory()
             source = self.source_factory(self.stop)
@@ -165,7 +172,7 @@ class StreamingPipeline:
                 end = self.clock()
                 item = PreparedFrame(frame_id,capture_ns,owned,rois,boxes,start,end)
                 self.record('prepared',frame_id=frame_id,capture_ns=capture_ns,prep_start_ns=start,prep_end_ns=end,valid_eyes=len(rois),
-                    input_sha256={s:hashlib.sha256(roi.transpose(2,0,1).tobytes()).hexdigest() for s,roi in rois.items()})
+                    input_sha256={s:hashlib.sha256((roi.transpose(2,0,1) if roi.ndim==3 else roi).tobytes()).hexdigest() for s,roi in rois.items()})
                 self.step.clear()
                 old = offer_latest(self.prepared,item)
                 if old is not None: self.record('dropped_preparation',frame_id=old.frame_id,replaced_by=frame_id)
@@ -181,10 +188,14 @@ class StreamingPipeline:
         client = None
         try:
             client = self.client_factory()
+            from fpga_host import METHOD_IDS, model_image
+            method_id = 4 if self.pretrained else METHOD_IDS[self.model.method]
             self.identity = client.load_model(self.model)
-            if (self.identity.get('method_id') != 4 or not self.identity.get('model_loaded') or
+            if (self.identity.get('method_id') != method_id or not self.identity.get('model_loaded') or
                 self.identity.get('fingerprint') != int(self.model.checkpoint_sha256[:8],16)):
-                raise RuntimeError('Invalid pretrained model fingerprint')
+                raise RuntimeError('Invalid model fingerprint')
+            if not self.pretrained and client.read_model() != model_image(self.model.params):
+                raise RuntimeError('TinyEye coefficient readback mismatch')
             client.configure(0,0)
             self.record('firmware',identity=self.identity)
             self.ready.set()
@@ -200,8 +211,16 @@ class StreamingPipeline:
                     client.invalidate(item.frame_id)
                 else:
                     self.record('submitted',frame_id=item.frame_id)
-                    hardware = client.infer_pretrained(*(item.rois[s] for s in SIDES),item.frame_id)
-                    if hardware.frame_id != item.frame_id or hardware.method_id != 4:
+                    if self.pretrained:
+                        hardware = client.infer_pretrained(*(item.rois[s] for s in SIDES),item.frame_id)
+                    else:
+                        from encoders import METHODS
+                        codes = [METHODS[self.model.method].encode(item.rois[s]) for s in SIDES]
+                        if getattr(client,'supports_capture_ns',False):
+                            hardware = client.infer(self.model.method,*codes,item.frame_id,capture_ns=item.capture_ns)
+                        else:
+                            hardware = client.infer(self.model.method,*codes,item.frame_id,(item.capture_ns//1000000)&0xffffffff)
+                    if hardware.frame_id != item.frame_id or hardware.method_id != method_id:
                         raise RuntimeError('Frame ID / method mismatch')
                     self.record('fpga_completed',frame_id=item.frame_id)
                 end = self.clock()
@@ -245,7 +264,14 @@ class StreamingPipeline:
                 if hardware is not None:
                     for side,logits in zip(SIDES,(hardware.left_logits,hardware.right_logits)):
                         if self.verify:
-                            expected=self.model.predict(item.rois[side],fixed=True)
+                            if self.pretrained:
+                                expected=self.model.predict(item.rois[side],fixed=True)
+                            else:
+                                from encoders import METHODS
+                                from integer_model import infer
+                                codes=METHODS[self.model.method].encode(item.rois[side])
+                                pixels=codes if self.model.method=='grayscale8' else codes*np.uint8(85)
+                                expected=infer(pixels[None,None],self.model.params)[0]
                             if not np.array_equal(logits,expected): raise RuntimeError('CPU/FPGA exact logit mismatch')
                         if reason is None:
                             eyes[side]=dict(logits=list(map(int,logits)),state='OPEN' if logits[0]>logits[1] else 'CLOSED' if logits[1]>logits[0] else 'UNAVAILABLE')

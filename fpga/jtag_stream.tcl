@@ -30,7 +30,7 @@ if {$mode eq "program-probe"} {
     # Explicit CLI programming stage only: the host has verified build/timing,
     # hashes and rollback. Keep the selected physical target in this session.
     set expected_usercode [lindex $argv 2]
-    if {$expected_usercode ni {1247037233 1247039025}} {error {Unsupported experimental image code}}
+    if {$expected_usercode ni {1247037233 1247039025 1247041841}} {error {Unsupported experimental image code}}
     source [file join [file dirname [info script]] play_ise_svf.tcl]
     play_ise_svf [lindex $argv 1]
     set s [jtag sequence]
@@ -58,6 +58,37 @@ proc restore_baseline {path} {
     if {([lindex $values 0]&32)==0 || [lindex $values 1]!=0x41454545} {error {Baseline restoration DONE/USERCODE failed}}
 }
 puts "JTREADY\t$original_frequency";flush stdout
+# Compact inference keeps bounded result polling beside the cable driver.
+# This removes host turnarounds; the FPGA wire contract and single credit stay
+# unchanged. Every final reply is still validated by the host against its request.
+proc compact_eye_exchange {hex} {
+    if {![regexp {^[0-9a-fA-F]+$} $hex] || [string length $hex]!=396} {error {Expected one 198-byte compact eye}}
+    set begin [clock microseconds]
+    set data [binary format H* $hex]
+    set s [jtag sequence]
+    $s drshift -state IDLE -binary 1584 $data
+    $s run -binary
+    $s delete
+    set uploaded [clock microseconds]
+    set zeros [binary format H* [string repeat 00 41]]
+    set polls 0
+    while {$polls<1000 && [clock microseconds]-$begin<5000000} {
+        set s [jtag sequence]
+        $s drshift -state IDLE -capture -binary 328 $zeros
+        set reply [lindex [$s run -binary] 0]
+        $s delete
+        incr polls
+        if {[string length $reply]!=41} {error {Compact reply width mismatch}}
+        binary scan $reply c* bytes
+        set size [expr {([lindex $bytes 8]&255)|(([lindex $bytes 9]&255)<<8)}]
+        set status [expr {[lindex $bytes 12]&255}]
+        if {!($size==0 && $status in {8 9})} {
+            binary scan $reply H* result
+            return [list [expr {$uploaded-$begin}] $polls [expr {[clock microseconds]-$begin}] $result]
+        }
+    }
+    error {Bounded compact result polling timed out}
+}
 while {[gets stdin line]>=0} {
     set fields [split $line "\t"]
     set op [lindex $fields 0];set id [lindex $fields 1]
@@ -76,6 +107,10 @@ while {[gets stdin line]>=0} {
             set s [jtag sequence];$s state RESET 16;$s state IDLE 16;$s run;$s delete
             select_user
             puts "JTRESET\t$id"
+        } elseif {$op eq "EYE"} {
+            if {[llength $fields]!=3} {error {Invalid compact exchange arguments}}
+            set result [compact_eye_exchange [lindex $fields 2]]
+            puts "JTEYE\t$id\t[join $result \t]"
         } elseif {$op eq "SCAN"} {
             set capture [lindex $fields 2];set count [lindex $fields 3];set hex [lindex $fields 4]
             if {$capture ni {0 1} || ![string is integer -strict $count] || $count<1 || $count>16 ||
