@@ -27,10 +27,13 @@ See the [architecture and ownership map](docs/REPOSITORY.md) and current
 [acceptance results](docs/VALIDATION_REPORT.md). Full live readiness requires
 valid detected eye pairs; successful ROI replay alone is insufficient.
 
-**Current status: PARTIALLY_READY.** The physical ROI replay and bounded worker
-pipeline pass; live camera runs and a five-minute runtime test completed, but
-the camera supplied almost-black images and no valid bilateral ROIs. A complete
-live eye-classification demonstration is therefore not yet accepted.
+**Opt-in JTAG CNN: physically verified.** The existing Xilinx cable and USER1
+complete **30.336 pairs/s versus 7.519 over UART (4.035x)** on identical complete
+workloads. All 4846 CEW eyes match fixed-point logits exactly; the P2 kernel stays
+14.70956 ms per pair. The design uses 1385 slices / 29 BRAM and meets 50 MHz.
+Independent 30 Hz input passed two short trials; sustained 50 Hz failed with
+explicit rejects. The canonical UART image remains the default and was restored.
+See [architecture, protocol, tests and reproduction](docs/JTAG_TRANSPORT.md).
 
 ## Validated results
 
