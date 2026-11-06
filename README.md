@@ -24,16 +24,19 @@ preparation, FPGA and result stages. Preparation can run ahead of the serial
 owner; the result stage owns CPU temporal state and the main thread owns OpenCV
 GUI. Traces distinguish request overlap from conservative kernel-overlap bounds.
 See the [architecture and ownership map](docs/REPOSITORY.md) and current
-[acceptance results](docs/VALIDATION_REPORT.md). Full live readiness requires
-valid detected eye pairs; successful ROI replay alone is insufficient.
+[acceptance results](docs/VALIDATION_REPORT.md).
 
-**Opt-in JTAG CNN: physically verified.** The existing Xilinx cable and USER1
-complete **30.336 pairs/s versus 7.519 over UART (4.035x)** on identical complete
-workloads. All 4846 CEW eyes match fixed-point logits exactly; the P2 kernel stays
-14.70956 ms per pair. The design uses 1385 slices / 29 BRAM and meets 50 MHz.
-Independent 30 Hz input passed two short trials; sustained 50 Hz failed with
-explicit rejects. The canonical UART image remains the default and was restored.
-See [architecture, protocol, tests and reproduction](docs/JTAG_TRANSPORT.md).
+The current optimization evaluation is **offline only**. It uses registered CEW
+inputs and explicitly synthetic schedules; it never opens a camera. See the
+[micro-batch feasibility and protocol decision](docs/STREAMING_MICROBATCH.md).
+The canonical UART RAW image remains the default.
+
+The opt-in **JTAG USER1 CNN variant is physically verified**: **30.336 pairs/s
+versus 7.519 over UART**, a **4.035x** improvement on identical complete workloads.
+All 4846 CEW eyes matched fixed-point logits exactly; the kernel remains 14.70956 ms
+per pair. The final design uses 1385 slices / 29 BRAM and meets 50 MHz. Independent
+30 Hz input passed two short trials; sustained 50 Hz failed with explicit rejects.
+See [architecture, protocol, measurements and reproduction](docs/JTAG_TRANSPORT.md).
 
 ## Validated results
 
@@ -115,15 +118,13 @@ default; camera demonstrations are not accuracy measurements.
 
 ## Streaming demonstration and reports
 
-The validated workstation used camera 1 and the board-associated CP210x at COM26.
-Select the corresponding camera/known board port on another machine. Give every
-experiment a new output directory; do not overwrite previous runs.
+Use registered offline eye inputs and the positively identified board port.
+Give every experiment a new output directory; do not overwrite previous runs.
 
 ```powershell
 $tag = Get-Date -Format 'yyyyMMdd_HHmmss'
-.\run.cmd live --camera 1 --seconds 5 --report "assets/runs/cpu_demo_$tag/session.json"
-.\run.cmd fpga --pipeline sequential --port COM26 --camera 1 --seconds 63 --warmup-seconds 3 --report "assets/runs/sequential_$tag/session.json"
-.\run.cmd fpga --pipeline overlap --port COM26 --camera 1 --seconds 63 --warmup-seconds 3 --report "assets/runs/overlap_$tag/session.json"
+.\run.cmd fpga --pipeline sequential --port COM26 --headless --warmup-seconds 0 --replay-manifest assets/datasets/cew/manifest.csv --replay-count 100 --replay-fps 10 --report "assets/runs/sequential_$tag/session.json"
+.\run.cmd fpga --pipeline overlap --port COM26 --headless --warmup-seconds 0 --replay-manifest assets/datasets/cew/manifest.csv --replay-count 100 --replay-fps 10 --report "assets/runs/overlap_$tag/session.json"
 ```
 
 `--headless` disables all window calls in explicit pipeline modes. `--verify`
