@@ -102,9 +102,12 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode",choices=("simulate","board"))
     parser.add_argument("--output",type=Path,required=True)
-    parser.add_argument("--port",default="COM26")
+    parser.add_argument("--port", help="UART port for the board test")
     parser.add_argument("--baud",type=int,default=115200,help="Use 1000000 for the canonical pretrained firmware")
-    args=parser.parse_args();output=args.output.resolve();output.mkdir(parents=True,exist_ok=False)
+    args=parser.parse_args()
+    if args.mode=="board" and not (args.port and args.port.strip()):
+        parser.error("--port is required for the board test")
+    output=args.output.resolve();output.mkdir(parents=True,exist_ok=False)
     result=dict(status="FAIL",mode=args.mode,scope="synthetic engineering evidence, not blink-detection accuracy")
     try:
         rows=golden_rows();(output/"goldens.json").write_text(json.dumps(rows,indent=2)+"\n")

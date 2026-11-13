@@ -13,6 +13,21 @@
     "OPEN",
     "CLOSED"
   ],
+  "output_contract": {
+    "native_classes": [
+      "CLOSED",
+      "OPEN"
+    ],
+    "classes": [
+      "OPEN",
+      "CLOSED"
+    ],
+    "canonical_from_native": [
+      1,
+      0
+    ],
+    "semantics_source": "https://github.com/openvinotoolkit/open_model_zoo/blob/2c9b5c563ab3a202d085a42e2bbfc48f77961f4b/demos/gaze_estimation_demo/cpp/src/eye_state_estimator.cpp"
+  },
   "weights": "signed INT16",
   "activations": "signed INT32",
   "accumulator": "signed INT48",

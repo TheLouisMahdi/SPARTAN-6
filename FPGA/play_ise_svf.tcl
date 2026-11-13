@@ -67,8 +67,24 @@ proc play_ise_svf {filename} {
                         error [format {SVF TDO mismatch: got 0x%X, expected %s, mask 0x%X} $actual $expected $mask_value]
                     }
                 } else {
-                    $seq $shift -state $endstate -binary $bits [svf_bytes $hex]
-                    $seq run
+                    set data [svf_bytes $hex]
+                    if {$verb eq "SDR" && $bits > 32768} {
+                        # Bound USB transfers while preserving a single TAP scan.
+                        if {$bits % 8 != 0 || [string length $data] != $bits/8} {
+                            error {Invalid large SDR data length}
+                        }
+                        for {set offset 0} {$offset < [string length $data]} {incr offset 4096} {
+                            set end [expr {min($offset + 4096, [string length $data])}]
+                            set next_state [expr {$end < [string length $data] ? "DRSHIFT" : $endstate}]
+                            set block [string range $data $offset [expr {$end-1}]]
+                            $seq $shift -state $next_state -binary [expr {8*[string length $block]}] $block
+                            $seq run
+                            $seq clear
+                        }
+                    } else {
+                        $seq $shift -state $endstate -binary $bits $data
+                        $seq run
+                    }
                 }
                 $seq delete
             }

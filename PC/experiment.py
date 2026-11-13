@@ -703,7 +703,7 @@ def experiment_cli(argv=None):
     for name in ("cew", "video", "golden"):
         command = sub.add_parser(name)
         command.add_argument("--mode", choices=("cpu", "fpga", "compare"), default="compare" if name == "golden" else "cpu")
-        command.add_argument("--port", default="COM26")
+        command.add_argument("--port", help="UART port for FPGA or comparison mode")
         command.add_argument("--cpu-precision", choices=("both", "fixed"), default="both",
                              help="both: measure FP32 and fixed references; fixed: one reference pass for CPU-only throughput")
         command.add_argument("--output", type=Path)
@@ -722,8 +722,8 @@ def experiment_cli(argv=None):
     args.output = args.output or ROOT/"RESULTS/runs/experiments"/(args.workload+"_"+args.mode+"_"+uuid.uuid4().hex[:12])
     if args.output.exists():
         parser.error("--output must be a new directory")
-    if args.mode != "cpu" and not args.port.strip():
-        parser.error("--port must be nonempty")
+    if args.mode != "cpu" and not (args.port and args.port.strip()):
+        parser.error("--port is required for FPGA or comparison mode")
     try:
         return run_offline(args)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:

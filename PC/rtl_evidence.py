@@ -303,7 +303,7 @@ def _build_project(output, pe_count, ise, network, baud, canonical=False):
     return result
 
 
-def board_suite(output, port="COM26"):
+def board_suite(output, port):
     """Synthetic UART arithmetic test on the currently programmed core; restore its model bytes.
 
     No webcam, personal checkpoint, threshold change or invented board result.
@@ -445,6 +445,7 @@ def program_svf(svf, output, expected_usercode=0x41454545):
     player = (ROOT / "FPGA/play_ise_svf.tcl").as_posix()
     script = f'''proc main {{}} {{
 connect -url tcp:127.0.0.1:3121
+jtag targets -set -filter {{name == "xc6slx9"}} -timeout 5
 set devices {{}}
 foreach target [jtag targets -target-properties] {{
     if {{[dict exists $target is_fpga] && [dict get $target is_fpga]}} {{lappend devices $target}}
@@ -464,7 +465,7 @@ if {{([lindex $result 0]&32)==0 || [lindex $result 1]!=0x{expected_usercode:08X}
 jtag unlock
 puts {{PROGRAM_PASS DONE USERCODE_{usercode_label}}}
 }}
-if {{[catch {{main}} message options]}} {{catch {{jtag unlock}};puts stderr [dict get $options -errorinfo];exit 1}}
+if {{[catch {{main}} message]}} {{catch {{jtag unlock}};puts stderr [lindex [split $message "\\n"] 0];exit 1}}
 exit 0
 '''
     (output / "program.tcl").write_text(script, encoding="ascii")
@@ -506,12 +507,14 @@ def main(argv=None):
     parser.add_argument("--pe-count", type=int, choices=(1, 2), default=2)
     parser.add_argument("--simulator", choices=("iverilog", "isim"), default="iverilog")
     parser.add_argument("--baseline-ref", help="Pre-extraction Git revision for cycle-level system comparison")
-    parser.add_argument("--port", default="COM26")
+    parser.add_argument("--port", help="UART port for the board test")
     parser.add_argument("--public-run", type=Path)
     parser.add_argument("--public-data", type=Path)
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--seed", type=int, choices=(42, 43, 44, 45, 46), default=42)
     args = parser.parse_args(argv)
+    if args.action == "board" and not (args.port and args.port.strip()):
+        parser.error("--port is required for the board test")
     if args.action == "system":
         from system_sim import simulate_system
         result = simulate_system(args.output, args.pe_count, baseline_ref=args.baseline_ref)

@@ -12,7 +12,7 @@ py -3.11 -m venv RESULTS/runtime
 & .\RESULTS\runtime\Scripts\python.exe -m pip check
 ```
 
-برای اجرای مجموعهٔ کامل تست‌ها، PyTorch نیز در همین محیط لازم است:
+برای اجرای مجموعهٔ کامل تست‌ها، PyTorch در همین محیط و Icarus Verilog 13.0 در مسیر `RESULTS/tools/iverilog/ucrt64/bin` لازم‌اند:
 
 ```powershell
 & .\RESULTS\runtime\Scripts\python.exe -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch==2.7.1+cpu'
@@ -43,9 +43,32 @@ Invoke-WebRequest 'https://storage.googleapis.com/mediapipe-models/face_landmark
 
 برای اجرای همان نمونه با محاسبات ثابت‌نقطه، `--precision fixed` را به دستور اضافه کنید.
 
-## ۳. اجرای FPGA
+## ۳. اجرای FPGA از طریق UART
 
-برای TinyEye ابتدا بستهٔ استقرار تأییدشده را با مسیرهای ثبت‌شده در `RESULTS/models/demo_deployment.json` بازیابی کنید. پیش‌بررسی فایل‌ها و سپس شناسایی برد:
+برای ساخت تصویر FPGA به Xilinx ISE 14.7 و برای بارگذاری موقت از طریق کابل JTAG به Vivado/XSDB 2023.2 نیاز است. اگر برد از قبل firmware سازگار دارد، مستقیم به اجرای وب‌کم بروید.
+
+```powershell
+.\PC\run.cmd build --network pretrained --pe-count 2
+if ($LASTEXITCODE -ne 0) { throw 'FPGA build failed' }
+.\PC\run.cmd program
+if ($LASTEXITCODE -ne 0) { throw 'FPGA programming failed' }
+```
+
+پورت مبدل UART را در Device Manager یا با فرمان زیر پیدا کنید:
+
+```powershell
+& .\RESULTS\runtime\Scripts\python.exe -m serial.tools.list_ports -v
+```
+
+`COM3` در مثال زیر یک نمونه است. آن را با پورت برد خود جایگزین کنید. مسیر Pretrained با نرخ ۱٬۰۰۰٬۰۰۰ baud کار می‌کند.
+
+```powershell
+.\PC\run.cmd fpga --port COM3 --camera 0 --pipeline sequential
+```
+
+## ۴. اجرای اختیاری TinyEye از طریق JTAG
+
+برای TinyEye فایل‌های بستهٔ استقرار تأییدشده را در `RESULTS/deployment` قرار دهید و مسیرهایشان را در `RESULTS/models/demo_deployment.json` ثبت کنید. پیش‌بررسی فایل‌ها و سپس شناسایی برد:
 
 ```powershell
 .\PC\run.cmd demo --model tiny --transport jtag --check --offline
@@ -58,24 +81,7 @@ Invoke-WebRequest 'https://storage.googleapis.com/mediapipe-models/face_landmark
 .\PC\run.cmd demo --model tiny --transport jtag --camera 0
 ```
 
-مسیر مستقیم UART برای بردی که از قبل firmware سازگار دارد:
-
-```powershell
-.\PC\run.cmd fpga --port COM3 --camera 0
-```
-
-در فرمان UART، `COM3` را با پورت واقعی برد جایگزین کنید.
-
-برای ساخت و برنامه‌ریزی، برد Spartan-6، Xilinx ISE 14.7 و Vivado/XSDB 2023.2 لازم است. پورت سریال را از Device Manager پیدا کنید و به‌جای `COM3` پورت خودتان را بنویسید.
-
-```powershell
-.\PC\run.cmd pretrained prepare
-.\PC\run.cmd build --network pretrained --pe-count 2
-.\PC\run.cmd program
-.\PC\run.cmd fpga --port COM3
-```
-
-اجرای CPU به برد نیاز ندارد. مسیر Pretrained FPGA از UART با نرخ ۱٬۰۰۰٬۰۰۰ baud استفاده می‌کند.
+بستهٔ TinyEye شامل checkpoint آموزش‌دیده، تصویر FPGA، فایل بازگشت و شواهد اعتبارسنجی است. این فایل‌ها باید جداگانه تهیه شوند.
 
 ## پوشه‌های خروجی
 

@@ -130,7 +130,9 @@ class HardwareResult:
 
 
 class FPGAClient:
-    def __init__(self, port="COM26", baud=115200, timeout=2.0):
+    def __init__(self, port, baud=115200, timeout=2.0):
+        if not port or not port.strip():
+            raise ValueError("A UART port is required")
         import serial
         self.serial = serial.Serial(port, baud, timeout=0.02, write_timeout=timeout)
         self.timeout = timeout

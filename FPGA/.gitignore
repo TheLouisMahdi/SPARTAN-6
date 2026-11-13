@@ -5,6 +5,14 @@
 /xst/
 /eye_top.bit
 /eye_top.mcs
+/eye_top.*
+!/eye_top.xise
+/eye_top_*
+/xlnx_auto_*/
+/svf.cmd
+/svf_generate.cmd
+/result.json
+/jtag_program_*/
 /eye_top_summary.html
 /*.log
 /webtalk*

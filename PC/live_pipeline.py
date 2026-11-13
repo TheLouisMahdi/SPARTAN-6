@@ -464,8 +464,8 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
     parser.add_argument("--output", type=Path, help="New experiment session directory")
     parser.add_argument("--workers", type=int, choices=(1, 2), default=2,
                         help="Pretrained CPU: 2 batches both eyes (default), 1 runs each eye separately. TinyEye CPU: worker count")
-    parser.add_argument("--camera", type=int, default=1, help="Integrated Camera on this laptop; choose explicitly if devices change")
-    parser.add_argument("--port", default="COM26", help="Opened only with --backend fpga")
+    parser.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
+    parser.add_argument("--port", help="UART port for FPGA inference")
     parser.add_argument("--verify", action="store_true", help="Also recompute FPGA logits on CPU; verification overhead is included")
     parser.add_argument("--seconds", type=float, default=0, help="0: run until Q/Esc")
     parser.add_argument("--status", action="store_true", help="Show readiness without opening camera or UART")
@@ -488,8 +488,6 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
         args.manifest = args.manifest or ROOT / "RESULTS/models" / args.encoder / "manifest.json"
         if args.output is not None and args.output.exists():
             parser.error("--output must be a new session directory")
-        if args.backend != "cpu" and not args.port.strip():
-            parser.error("A nonempty UART port is required")
     if args.camera < 0 or not np.isfinite(args.seconds) or args.seconds < 0:
         parser.error("Camera must be nonnegative; seconds must be finite and nonnegative")
     if forced_backend and args.backend != forced_backend:
@@ -516,6 +514,10 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
         cpu_mode = "; paired batch" if pretrained and args.backend == "cpu" and args.workers == 2 else ""
         print(f"BACKEND: {args.backend}{cpu_mode}; camera/UART not opened")
         return 0
+    if args.backend == "fpga" and not model.ready:
+        parser.exit(1, "Train and explicitly activate a model before FPGA inference. No devices opened.\n")
+    if args.backend != "cpu" and client_factory is None and not (args.port and args.port.strip()):
+        parser.error("--port is required for FPGA inference")
     if args.pipeline:
         if args.backend != 'fpga' or experiment or not model.ready:
             parser.error('--pipeline requires a trained FPGA model without experiment mode')
@@ -524,8 +526,6 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
         return run_streaming(args,model,client_factory)
     if args.headless or args.replay_manifest:
         parser.error('--headless/--replay-manifest require an explicit --pipeline')
-    if args.backend == "fpga" and not model.ready:
-        parser.exit(1, "Train and explicitly activate a model before FPGA inference. No devices opened.\n")
 
     # Heavy device imports and initialization happen only after the readiness checks.
     import cv2

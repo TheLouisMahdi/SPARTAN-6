@@ -256,7 +256,7 @@ def main(argv=None):
     parser.add_argument("--transport", choices=("auto", "jtag", "uart"), default="auto")
     parser.add_argument("--model", choices=("auto", "tiny", "pretrained"), default="auto")
     parser.add_argument("--deployment", type=Path, default=CATALOG)
-    parser.add_argument("--camera", type=int, default=1, help="Webcam index for live execution")
+    parser.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
     args = parser.parse_args(argv)
     if args.offline and not args.check:
         parser.error("--offline requires --check")

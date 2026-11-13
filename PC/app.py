@@ -441,9 +441,9 @@ FPGA_WINDOW="AEEE FPGA inference | SPARTAN-6 INT8 | Q / ESC to quit"
 
 def fpga_cli():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port",default="COM26")
-    parser.add_argument("--camera",type=int,default=0,help="Webcam index; this laptop's Integrated Camera is 1")
-    parser.add_argument("--run-dir",type=Path,default=ASSETS/"runs/personal_v2_mvr44liv")
+    parser.add_argument("--port", required=True)
+    parser.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
+    parser.add_argument("--run-dir", type=Path, required=True, help="Frozen TinyEye training run")
     parser.add_argument("--method",choices=tuple(METHODS),default="grayscale8")
     parser.add_argument("--seed",type=int,default=43)
     parser.add_argument("--seconds",type=float,default=0)
@@ -732,8 +732,8 @@ def baseline_preview(frame, boxes, scores, timing, fps, inference_ms, age_ms, fp
 
 def baseline_cli(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--camera", type=int, default=0, help="Webcam index; Integrated Camera is currently 1")
-    parser.add_argument("--port", help="Optional FPGA timing backend, e.g. COM26; requires binocular timing bitstream")
+    parser.add_argument("--camera", type=int, default=0, help="Webcam index (default: 0)")
+    parser.add_argument("--port", help="Optional FPGA timing backend; requires the binocular timing bitstream")
     parser.add_argument("--seconds", type=float, default=0, help="0: run until Q/Esc")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--stop-file", type=Path)
@@ -992,11 +992,15 @@ def replay_cli(argv=None):
     parser.add_argument("--session-id", help="Default: video SHA256 plus CFR rate, shared across backends")
     parser.add_argument("--method", choices=tuple(METHODS), default="aeee2")
     parser.add_argument("--seed", type=int, default=43)
-    parser.add_argument("--run-dir", type=Path, default=ASSETS / "runs/personal_v2_mvr44liv")
+    parser.add_argument("--run-dir", type=Path, help="Frozen TinyEye training run for int8 or fpga")
     parser.add_argument("--left-threshold", type=int, default=0)
     parser.add_argument("--right-threshold", type=int, default=0)
-    parser.add_argument("--port", default="COM26", help="Used only with --backend fpga")
+    parser.add_argument("--port", help="UART port for --backend fpga")
     args = parser.parse_args(argv)
+    if args.backend != "pretrained" and args.run_dir is None:
+        parser.error("--run-dir is required for TinyEye inference")
+    if args.backend == "fpga" and not (args.port and args.port.strip()):
+        parser.error("--port is required for FPGA inference")
     args.video = args.video.resolve()
     args.output = args.output.resolve()
     if not args.video.is_file():

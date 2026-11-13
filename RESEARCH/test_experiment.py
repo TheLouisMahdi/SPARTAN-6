@@ -335,7 +335,7 @@ class ExperimentTests(unittest.TestCase):
             "print(json.dumps([str(Path.cwd()), sys.argv[1:], sys.executable]))\n"
             "raise SystemExit(0 if sys.argv[1] == 'live' else 37 if sys.argv[1] == 'fpga' else 2)\n",
             encoding="utf-8")
-        for args, code in ((["live", "--status"], 0), (["fpga", "--port", "COM26"], 37),
+        for args, code in ((["live", "--status"], 0), (["fpga", "--port", "COM3"], 37),
                            (["wrong"], 2), (["live", "--report", "path with spaces.json"], 0)):
             process = run(*args)
             self.assertEqual(process.returncode, code, process.stderr)
@@ -384,6 +384,8 @@ class OfflineExperimentTests(unittest.TestCase):
     def run_cew(self, manifest, mode="cpu", output="run", client=None):
         from experiment import experiment_cli
         args = ["cew", "--manifest", str(manifest), "--mode", mode, "--output", str(self.root/output)]
+        if mode != "cpu":
+            args += ["--port", "COM3"]
         with redirect_stdout(io.StringIO()), patch("fpga_host.FPGAClient", return_value=client) if client else patch("fpga_host.FPGAClient", side_effect=AssertionError("No board requested")):
             code = experiment_cli(args)
         return code, self.root/output
@@ -587,7 +589,7 @@ class OfflineExperimentTests(unittest.TestCase):
     def test_missing_dataset_stops_before_serial_and_writes_status(self):
         from experiment import experiment_cli
         with patch("fpga_host.FPGAClient",side_effect=AssertionError("Must not open UART")),redirect_stdout(io.StringIO()):
-            self.assertEqual(experiment_cli(["cew","--manifest",str(self.root/"missing.csv"),"--mode","fpga","--output",str(self.root/"missing")]),1)
+            self.assertEqual(experiment_cli(["cew","--manifest",str(self.root/"missing.csv"),"--mode","fpga","--port","COM3","--output",str(self.root/"missing")]),1)
         self.assertEqual(json.loads((self.root/"missing/session.json").read_text())["status"],"DATA_NOT_AVAILABLE")
         self.assertTrue((self.root/"missing/report.html").is_file())
 

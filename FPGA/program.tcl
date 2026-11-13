@@ -6,11 +6,12 @@ proc main {directory} {
     }
     if {[file mtime eye_top.svf] < [file mtime eye_top.bit]} {error {Stale SVF: run build.cmd}}
     connect -url tcp:127.0.0.1:3121
+    jtag targets -set -filter {name == "xc6slx9"} -timeout 5
     set devices {}
     foreach target [jtag targets -target-properties] {
         if {[dict exists $target is_fpga] && [dict get $target is_fpga]} {lappend devices $target}
     }
-    if {[llength $devices]!=1 || [dict get [lindex $devices 0] name] ne "xc6slx9"} {error {Expected one XC6SLX9}}
+    if {[llength $devices]!=1 || [dict get [lindex $devices 0] name] ne "xc6slx9" || [dict get [lindex $devices 0] idcode] ne "24001093" || [dict get [lindex $devices 0] irlen]!=6} {error {Expected one verified XC6SLX9}}
     jtag targets -set -filter {name == "xc6slx9"}
     jtag lock 10000
     source {play_ise_svf.tcl}
@@ -26,5 +27,5 @@ proc main {directory} {
     jtag unlock
     puts {PASS: actual CNN/UART bitstream loaded; DONE high; USERCODE AEEE.}
 }
-if {[catch {main $directory} message options]} {catch {jtag unlock};puts stderr [dict get $options -errorinfo];exit 1}
+if {[catch {main $directory} message]} {catch {jtag unlock};puts stderr [lindex [split $message "\n"] 0];exit 1}
 exit 0
