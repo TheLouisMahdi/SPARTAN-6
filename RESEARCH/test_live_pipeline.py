@@ -642,5 +642,85 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual([e['frame_id'] for e in events if e['kind']=='published'],list(range(1,6)))
 
 
+    def test_tensor_trace_is_opt_in_and_bounded(self):
+        import base64
+        import hashlib
+        from stream_pipeline import StreamingPipeline
+
+        pipe, events, *_ = self.make(values=(1, 2), mode='sequential')
+        pipe.tensor_frame_ids = frozenset((1,))
+        pipe.start()
+        self.finish(pipe)
+        prepared = [event for event in events if event['kind'] == 'prepared']
+        self.assertEqual([event['frame_id'] for event in prepared], [1, 2])
+        self.assertIsNone(prepared[1]['approved_tensor_samples'])
+        sample = prepared[0]['approved_tensor_samples']['left']
+        payload = base64.b64decode(sample['base64'], validate=True)
+        self.assertEqual(sample['shape'], [3, 4, 4])
+        self.assertEqual(sample['dtype'], 'uint8')
+        self.assertEqual(sample['layout'], 'CHW')
+        self.assertEqual(sample['channel_order'], 'BGR')
+        self.assertEqual(sample['sha256'], hashlib.sha256(payload).hexdigest())
+        self.assertEqual(prepared[0]['input_sha256']['left'], sample['sha256'])
+        self.assertEqual(prepared[0]['boxes'], {})
+
+        for ids in ((1, 1), (0,), (1, 2, 3, 4, 5)):
+            with self.subTest(ids=ids):
+                with self.assertRaises(ValueError):
+                    StreamingPipeline(pipe.source_factory, pipe.prepare_factory,
+                        pipe.client_factory, pipe.model, tensor_frame_ids=ids)
+
+    def test_flow_diagnostic_preserves_missing_and_derived_values(self):
+        from pipeline_report import export_flow_diagnostic
+        events = [
+            dict(kind='capture', frame_id=7, capture_ns=1_000_000_000),
+            dict(kind='preparation_components', capture_ns=1_000_000_000,
+                 landmark_start_ns=1_001_000_000, landmark_end_ns=1_011_000_000,
+                 roi_end_ns=1_013_000_000),
+            dict(kind='prepared', frame_id=7, capture_ns=1_000_000_000,
+                 prep_start_ns=1_001_000_000, prep_end_ns=1_014_000_000,
+                 valid_eyes=2, boxes={'left': [1, 2, 3, 4]},
+                 input_sha256={'left': 'abc'}, tensor_metadata={'left': {'shape': [3, 32, 32]}}),
+            dict(kind='inference', frame_id=7, fpga_start_ns=1_020_000_000,
+                 fpga_end_ns=1_120_000_000, uart_upload_ms=60.0,
+                 uart_roundtrip_ms=100.0, cycles=[367739, 367739, 735478]),
+            dict(kind='published', frame_id=7, capture_ns=1_000_000_000,
+                 result_start_ns=1_120_000_000, result_end_ns=1_122_000_000,
+                 reason=None, eyes={'left': {'state': 'OPEN'}, 'right': {'state': 'UNAVAILABLE'}},
+                 raw_logits=[[11, -2], [1, 1]], blink_count=0, blink_event=False),
+            dict(kind='display_expired', frame_id=7, age_ms=260),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            report = export_flow_diagnostic(temporary,
+                dict(source_revision='testsha', source='LIVE_CAMERA_MEDIAPIPE',
+                     model_method='omz_bgr32', mode='sequential', status='PASS'),
+                {'counts': {'capture': 1}}, events)
+            disk = json.loads((Path(temporary) / 'flow_diagnostic.json').read_text())
+            self.assertEqual(disk, report)
+            self.assertEqual(report['runtime']['total_frames'], 1)
+            frame = report['runtime']['frames'][0]
+            self.assertEqual(frame['frame_id'], 7)
+            self.assertEqual(frame['bounding_boxes']['value']['left'], [1, 2, 3, 4])
+            self.assertEqual(frame['measurements']['landmarks_ms']['value'], 10.0)
+            self.assertEqual(frame['measurements']['end_to_end_ms']['value'], 122.0)
+            self.assertIsNone(frame['measurements']['uart_response_only_ms']['value'])
+            self.assertEqual(frame['raw_logits_native']['value'], [[-2, 11], [1, 1]])
+            self.assertEqual(frame['raw_logits_native']['provenance'], 'derived_class_permutation')
+            self.assertIn('equal_logits', frame['validity_tags'])
+            self.assertIn('gui_display_expired', frame['validity_tags'])
+            self.assertIsNone(frame['approved_tensor_samples'])
+
+    def test_flow_diagnostic_replay_topology(self):
+        from pipeline_report import export_flow_diagnostic
+        with tempfile.TemporaryDirectory() as temporary:
+            report = export_flow_diagnostic(temporary,
+                dict(source='ROI_REPLAY_ONLY', model_method='omz_bgr32', mode='overlap'),
+                {'counts': {}}, [])
+            identifiers = {node['id'] for node in report['architecture']['nodes']}
+            self.assertIn('replay', identifiers)
+            self.assertNotIn('capture', identifiers)
+            self.assertEqual(report['runtime']['selected_frames'], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

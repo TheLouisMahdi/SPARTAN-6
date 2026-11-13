@@ -201,6 +201,99 @@ class OcularTests(unittest.TestCase):
                         pts_milliseconds("fixture")
 
 
+class PersonalPhotoTests(unittest.TestCase):
+    def test_contrast_normalization_preserves_tensor_contract(self):
+        from encoders.grayscale8 import normalize_contrast
+
+        eye = np.tile(np.arange(32, dtype=np.uint8), (16, 1)) + 32
+        original = eye.copy()
+        normalized = normalize_contrast(eye)
+        np.testing.assert_array_equal(eye, original)
+        np.testing.assert_array_equal(normalized, normalize_contrast(eye + 20))
+        self.assertEqual(normalized.shape, (16, 32))
+        self.assertEqual(normalized.dtype, np.uint8)
+        self.assertGreater(np.ptp(normalized), np.ptp(eye))
+        self.assertTrue(np.all(normalize_contrast(np.full_like(eye, 64)) == 128))
+
+    def test_guided_review_keeps_subject_sides_and_original_timestamp(self):
+        from capture import GUIDED_POSES, guided_eye_order, guided_pair_hash
+        from dataset import DatasetError, DatasetSession, validate_dataset
+        import time
+
+        self.assertTrue(guided_eye_order({"left": (60, 10, 90, 25), "right": (10, 10, 40, 25)}))
+        self.assertFalse(guided_eye_order({"right": (60, 10, 90, 25), "left": (10, 10, 40, 25)}))
+        self.assertFalse(guided_eye_order({"left": (60, 10, 90, 25)}))
+        _, left, right = GUIDED_POSES[ord("3")]
+        now = time.monotonic_ns()
+        sample = dict(frame_id=1, capture_timestamp_ns=now - 2_000_000_000,
+                      left_eye_roi=np.zeros((16, 32), np.uint8), right_eye_roi=np.ones((16, 32), np.uint8))
+        self.assertEqual(guided_pair_hash(sample), guided_pair_hash(dict(sample, frame_id=2)))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with DatasetSession(root, "P001", "development") as session:
+                with self.assertRaisesRegex(DatasetError, "stale"):
+                    session.save_pair(sample, left, right)
+                session.save_pair(sample, left, right, review_started_ns=now - 1_900_000_000)
+            row, = validate_dataset(root)
+            self.assertEqual((row["left_label"], row["right_label"]), ("CLOSED", "OPEN"))
+            self.assertEqual(int(row["capture_timestamp_ns"]), sample["capture_timestamp_ns"])
+
+    def test_closed_f2_and_zero_denominators(self):
+        from research import metrics
+
+        for actual, predicted, f2, open_recall in (
+            ([0, 1], [0, 1], 1.0, 1.0),
+            ([0, 1, 1], [0, 1, 0], 5 / 9, 1.0),
+            ([0, 0, 1], [0, 1, 1], 5 / 6, 0.5),
+            ([0, 1], [0, 0], 0.0, 1.0),
+            ([0, 1], [1, 1], 5 / 6, 0.0),
+            ([0], [0], 0.0, 1.0),
+            ([1], [1], 1.0, 0.0),
+            ([], [], 0.0, 0.0),
+        ):
+            with self.subTest(actual=actual, predicted=predicted):
+                report = metrics(actual, predicted)
+                self.assertAlmostEqual(report["closed_f2"], f2)
+                self.assertEqual(report["per_class"]["OPEN"]["recall"], open_recall)
+
+    def test_checkpoint_ranking_uses_only_validation_and_preserves_open_gate(self):
+        from research import metrics, photo_checkpoint_rank
+
+        def record(predicted, epoch=1, loss=0.5):
+            return dict(validation=metrics([0, 0, 1, 1], predicted), epoch=epoch, validation_loss=loss)
+
+        def rank(row):
+            return photo_checkpoint_rank(row, 0.95)
+
+        safe = record([0, 0, 1, 0])
+        all_closed = record([1, 1, 1, 1])
+        self.assertGreater(all_closed["validation"]["closed_f2"], safe["validation"]["closed_f2"])
+        self.assertFalse(rank(all_closed)[0])
+        self.assertFalse(rank(record([0, 0, 0, 0]))[0])
+        self.assertGreater(rank(safe), rank(all_closed))
+        perfect = record([0, 0, 1, 1])
+        self.assertGreater(rank(perfect), rank(safe))
+        self.assertEqual(rank(dict(safe, test=perfect["validation"])), rank(safe))
+        self.assertGreater(rank(dict(safe, validation_loss=0.4, epoch=2)), rank(safe))
+        self.assertGreater(rank(safe), rank(dict(safe, epoch=2)))
+        tied = dict(safe["validation"], per_class={
+            **safe["validation"]["per_class"], "CLOSED": {"support": 2, "recall": 1.0}})
+        self.assertGreater(rank(dict(safe, validation=tied, validation_loss=1.0)), rank(safe))
+
+    def test_augmentation_preserves_input_and_is_reproducible(self):
+        from research import augment_photo_eyes
+
+        pixels = np.arange(1024, dtype=np.uint16).astype(np.uint8).reshape(2, 1, 16, 32)
+        original = pixels.copy()
+        first = augment_photo_eyes(pixels, np.random.default_rng(42))
+        second = augment_photo_eyes(pixels, np.random.default_rng(42))
+        np.testing.assert_array_equal(pixels, original)
+        np.testing.assert_array_equal(first, second)
+        self.assertEqual(first.shape, pixels.shape)
+        self.assertEqual(first.dtype, np.uint8)
+        self.assertFalse(np.array_equal(first, original))
+
+
 class PublicDataTests(unittest.TestCase):
     def test_labels_and_identity_split(self):
         self.assertEqual(binary_label("0.0"), "OPEN")

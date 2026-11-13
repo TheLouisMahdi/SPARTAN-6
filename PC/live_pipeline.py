@@ -380,9 +380,12 @@ def run_streaming(args, model, client_factory=None):
     def emit(event): trace.write(event)
     startup_timeout = 75 if client_factory is not None else 5
     pipe=StreamingPipeline(source,Prepare,client_factory or (lambda:FPGAClient(args.port,baud=args.baud or 1000000)),model,
-        mode=args.pipeline,verify=args.verify,emit=emit,startup_timeout=startup_timeout,prepared_capacity=1 if pretrained else 4)
+        mode=args.pipeline,verify=args.verify,emit=emit,startup_timeout=startup_timeout,
+        prepared_capacity=1 if pretrained else 4, tensor_frame_ids=args.tensor_frame_id)
     meta=dict(schema_version=1,report_kind='stream_pipeline_v1',mode=args.pipeline,source='ROI_REPLAY_ONLY' if replay_rows else 'LIVE_CAMERA_MEDIAPIPE',
-        provenance='PHYSICAL_MEASUREMENT',model_sha256=model.checkpoint_sha256,output_order=['OPEN','CLOSED'],
+        provenance='PHYSICAL_MEASUREMENT' if client_factory is None else 'INJECTED_TRANSPORT_UNVERIFIED',
+        model_method=model.method,tensor_frame_ids=list(args.tensor_frame_id),
+        model_sha256=model.checkpoint_sha256,output_order=['OPEN','CLOSED'],
         source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
         dirty_status=subprocess.check_output(['git','status','--short'],cwd=ROOT,text=True),
         bitstream_sha256_local_artifact=(getattr(client_factory,'deployment',{}).get('bit',{}).get('sha256') or
@@ -403,6 +406,7 @@ def run_streaming(args, model, client_factory=None):
             replay_timestamp_definition='synthetic fixed-rate capture epoch; trace at_ns records actual dispatch, including scheduler lateness',
             replay_selection='Source SHA256 order; first 2*count eye patches; no label/model-based selection')
     exit_code=0; first_capture=None; duration_completed=False; ui_polls=0; ui_last=None; ui_max_gap_ms=None
+    last_expired_frame_id=None
     memory_samples=deque(maxlen=64);next_memory=0;latest_snapshot=None
     window='SPARTAN-6 | CPU-FPGA PIPELINE'
     trace=BoundedLog(directory/'trace.jsonl',formatter=lambda event:json.dumps(event)+'\n')
@@ -422,7 +426,13 @@ def run_streaming(args, model, client_factory=None):
             except Empty: snapshot=None
             if snapshot is not None: latest_snapshot=snapshot
             if latest_snapshot is not None and not args.headless:
-                display=render_stream_preview(latest_snapshot,time.perf_counter_ns(),pipe.counts,pipe.first_capture_ns or meta['start_ns'],args.pipeline)
+                display_ns=time.perf_counter_ns()
+                displayed_item=latest_snapshot.inference.prepared
+                age_ms=(display_ns-displayed_item.capture_ns)/1e6
+                if age_ms>MAXIMUM_GAP_MS and last_expired_frame_id!=displayed_item.frame_id:
+                    pipe.record('display_expired',frame_id=displayed_item.frame_id,age_ms=age_ms)
+                    last_expired_frame_id=displayed_item.frame_id
+                display=render_stream_preview(latest_snapshot,display_ns,pipe.counts,pipe.first_capture_ns or meta['start_ns'],args.pipeline)
                 cv2.imshow(window,display)
             if not args.headless:
                 ui_now=time.perf_counter_ns();ui_polls+=1
@@ -477,6 +487,8 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
     parser.add_argument("--replay-manifest", type=Path, help="Registered CEW manifest for ROI_REPLAY_ONLY, never a camera benchmark")
     parser.add_argument("--replay-count", type=int, default=20)
     parser.add_argument("--replay-fps", type=float, default=4, help="Identical host-clock ROI replay pacing for both modes")
+    parser.add_argument("--tensor-frame-id", type=int, action="append", default=[],
+                        help="Explicitly approve embedding the canonical tensor for this frame ID (maximum four IDs)")
     args = parser.parse_args(argv)
     experiment = args.encoder is not None or args.backend == "compare" or args.output is not None
     if experiment and not args.encoder:
@@ -490,6 +502,11 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
             parser.error("--output must be a new session directory")
     if args.camera < 0 or not np.isfinite(args.seconds) or args.seconds < 0:
         parser.error("Camera must be nonnegative; seconds must be finite and nonnegative")
+    if args.tensor_frame_id and not args.pipeline:
+        parser.error("--tensor-frame-id requires --pipeline")
+    if (len(args.tensor_frame_id) > 4 or len(set(args.tensor_frame_id)) != len(args.tensor_frame_id)
+            or any(frame_id <= 0 for frame_id in args.tensor_frame_id)):
+        parser.error("Provide at most four unique positive --tensor-frame-id values")
     if forced_backend and args.backend != forced_backend:
         parser.error(f"This command requires --backend {forced_backend}")
     if args.verify and args.backend != "fpga":
@@ -536,6 +553,7 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
     pending, errors = Queue(maxsize=1), Queue(maxsize=1)
     stop, stopped = Event(), Event()
     camera_worker = landmarker = client = pipeline = session = None
+    hardware_ready = False
     timer = BinocularTimer()
     frame_stream = writer = None
     frame_origin_ms = None
@@ -582,6 +600,7 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
                 session.hardware(loaded)
             client.configure(0, 0)
             client.reset_blinks()
+            hardware_ready = True
         if experiment:
             from experiment import ComparisonPipeline
             pipeline = ComparisonPipeline(model, args.backend, client)
@@ -719,7 +738,8 @@ def live_cli(argv=None, forced_backend=None, client_factory=None):
             landmarker.close()
         if client:
             try:
-                client.invalidate(0)
+                if hardware_ready:
+                    client.invalidate(0)
             except Exception as exc:
                 print(f"FPGA shutdown error: {exc}", flush=True)
                 exit_code = 1

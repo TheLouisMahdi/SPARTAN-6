@@ -3,6 +3,7 @@
 No GUI, device discovery or device opening occurs on import. Temporal state is
 owned by the result thread; hardware-timer diagnostics remain in live_pipeline.
 """
+import base64
 from collections import Counter
 import hashlib
 from dataclasses import dataclass
@@ -88,11 +89,17 @@ class StreamingPipeline:
     stages with a completion barrier before accepting the next source frame.
     """
     def __init__(self, source_factory, prepare_factory, client_factory, model,
-                 mode='overlap', verify=False, emit=None, clock=time.perf_counter_ns, startup_timeout=5, prepared_capacity=1):
+                 mode='overlap', verify=False, emit=None, clock=time.perf_counter_ns,
+                 startup_timeout=5, prepared_capacity=1, tensor_frame_ids=()):
         if mode not in ('sequential', 'overlap'):
             raise ValueError('Unknown pipeline mode')
-        if prepared_capacity not in (1,2,3,4):
+        if prepared_capacity not in (1, 2, 3, 4):
             raise ValueError('Prepared queue must remain bounded to 1..4 frames')
+        approved = tuple(tensor_frame_ids)
+        if (len(approved) > 4 or len(set(approved)) != len(approved)
+                or any(type(frame_id) is not int or frame_id <= 0 for frame_id in approved)):
+            raise ValueError('At most four unique positive tensor frame IDs are allowed')
+        self.tensor_frame_ids = frozenset(approved)
         self.source_factory, self.prepare_factory = source_factory, prepare_factory
         self.client_factory, self.model = client_factory, model
         self.pretrained = model.method == 'omz_bgr32'
@@ -171,8 +178,28 @@ class StreamingPipeline:
                 boxes = MappingProxyType(dict(boxes))
                 end = self.clock()
                 item = PreparedFrame(frame_id,capture_ns,owned,rois,boxes,start,end)
-                self.record('prepared',frame_id=frame_id,capture_ns=capture_ns,prep_start_ns=start,prep_end_ns=end,valid_eyes=len(rois),
-                    input_sha256={s:hashlib.sha256((roi.transpose(2,0,1) if roi.ndim==3 else roi).tobytes()).hexdigest() for s,roi in rois.items()})
+                input_sha256 = {}
+                tensor_metadata = {}
+                approved_tensor_samples = {} if frame_id in self.tensor_frame_ids else None
+                for side, roi in rois.items():
+                    tensor = np.ascontiguousarray(roi.transpose(2, 0, 1)) if roi.ndim == 3 else np.ascontiguousarray(roi)
+                    raw = tensor.tobytes(order='C')
+                    digest = hashlib.sha256(raw).hexdigest()
+                    input_sha256[side] = digest
+                    tensor_metadata[side] = dict(shape=list(tensor.shape), dtype=str(tensor.dtype),
+                        layout='CHW' if roi.ndim == 3 else 'HW',
+                        channel_order='BGR' if roi.ndim == 3 else 'GRAY', byte_count=len(raw))
+                    if approved_tensor_samples is not None:
+                        approved_tensor_samples[side] = dict(
+                            shape=list(tensor.shape), dtype=str(tensor.dtype),
+                            layout=tensor_metadata[side]['layout'],
+                            channel_order=tensor_metadata[side]['channel_order'],
+                            sha256=digest, base64=base64.b64encode(raw).decode('ascii'))
+                self.record('prepared', frame_id=frame_id, capture_ns=capture_ns,
+                    prep_start_ns=start, prep_end_ns=end, valid_eyes=len(rois),
+                    boxes={side: list(box) for side, box in boxes.items()},
+                    tensor_metadata=tensor_metadata, input_sha256=input_sha256,
+                    approved_tensor_samples=approved_tensor_samples)
                 self.step.clear()
                 old = offer_latest(self.prepared,item)
                 if old is not None: self.record('dropped_preparation',frame_id=old.frame_id,replaced_by=frame_id)

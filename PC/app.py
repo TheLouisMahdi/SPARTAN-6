@@ -1270,7 +1270,7 @@ def hardware_cli(action):
 def main():
     """Start the pinned pretrained classifier; archived research remains explicit."""
     commands = ("demo", "live", "compare", "experiment", "dataset", "session-report", "test-all", "model", "fpga", "host", "baseline", "replay", "predict", "capture", "collect", "build", "program",
-                "prepare", "import", "encode", "train", "personal", "ablation", "events", "evidence", "rtl", "pretrained")
+                "prepare", "import", "encode", "train", "personal", "train-photos", "ablation", "events", "evidence", "rtl", "pretrained")
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("command", nargs="?", choices=commands, default="live")
@@ -1322,6 +1322,9 @@ def main():
     if command in ("train", "personal", "ablation"):
         from research import train_cli, personal_cli, ablation_cli
         return {"train": train_cli, "personal": personal_cli, "ablation": ablation_cli}[command]()
+    if command == "train-photos":
+        from research import personal_photos_cli
+        return personal_photos_cli()
     if command == "events":
         from eye_state import evaluate_events_cli
         return evaluate_events_cli()

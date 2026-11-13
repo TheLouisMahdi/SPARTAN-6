@@ -1,6 +1,7 @@
 """Camera ownership, unchanged canonical ROI extraction and manual collection."""
 
 import argparse
+import hashlib
 import math
 import sys
 import time
@@ -343,12 +344,174 @@ def beep():
     Thread(target=sound, daemon=True).start()
 
 
+GUIDED_POSES = {
+    ord("1"): ("BOTH_OPEN", "OPEN", "OPEN"),
+    ord("2"): ("BOTH_CLOSED", "CLOSED", "CLOSED"),
+    ord("3"): ("LEFT_CLOSED", "CLOSED", "OPEN"),
+    ord("4"): ("RIGHT_CLOSED", "OPEN", "CLOSED"),
+}
+
+
+def guided_eye_order(boxes):
+    """Subject-left must be to the right of subject-right in the unmirrored preview."""
+    if set(boxes) != {"left", "right"}:
+        return False
+    return boxes["left"][0] + boxes["left"][2] > boxes["right"][0] + boxes["right"][2]
+
+
+def guided_pair_hash(record):
+    return hashlib.sha256(b"".join(record[f"{side}_eye_roi"].tobytes()
+                                   for side in ("left", "right"))).hexdigest()
+
+
+def collect_guided(args):
+    from datetime import timezone
+    from dataset import validate_dataset
+
+    parent = args.data_dir.resolve()
+    root = parent / args.guided
+    other = parent / ("acceptance" if args.guided == "development" else "development")
+    if args.guided == "acceptance":
+        completed = json.loads((other / "collection.json").read_text()) if (other / "collection.json").is_file() else {}
+        if not completed.get("complete"):
+            raise DatasetError("Complete the guided development session before collecting acceptance.")
+    previous = json.loads((other / "collection.json").read_text()) if (other / "collection.json").is_file() else {}
+    known_photos = {item["image_sha256"] for item in previous.get("samples", [])}
+    known_pairs = {item["roi_pair_sha256"] for item in previous.get("samples", [])}
+    validate_identifier(args.subject_id)
+    root.mkdir(parents=True, exist_ok=False)
+    session_id = f"{args.guided}_{uuid4().hex[:12]}"
+    report = dict(session_id=session_id, split=args.guided, sealed=args.guided == "acceptance",
+                  complete=False, target_per_pose=10, samples=[])
+    write_json(root / "collection.json", report)
+    originals = root / "originals"
+    originals.mkdir()
+    pending, errors = Queue(1), Queue(1)
+    stop, stopped = Event(), Event()
+    worker = Thread(target=capture_frames, args=(pending, errors, stop, stopped), daemon=True)
+    window = "TinyEye guided collection"
+    counts = Counter()
+    group = 1
+    group_has_samples = False
+    review = None
+    feedback = "Change gaze, head position or lighting between shots."
+    options = vision.FaceLandmarkerOptions(base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH)),
+                                          running_mode=vision.RunningMode.IMAGE, num_faces=1)
+    try:
+        with DatasetSession(root, args.subject_id, session_id, args.guided) as session, \
+                vision.FaceLandmarker.create_from_options(options) as landmarker:
+            worker.start()
+            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window, 960, 600)
+            while min(counts[pose] for pose, _, _ in GUIDED_POSES.values()) < 10:
+                if args.stop_file and args.stop_file.exists():
+                    break
+                if stopped.is_set():
+                    raise DatasetError(errors.get_nowait() if not errors.empty() else "Camera stopped")
+                try:
+                    frame_id, timestamp, frame = pending.get(timeout=1)
+                except Empty:
+                    raise DatasetError("No camera frame available")
+                preview = (review["frame"] if review else frame).copy()
+                if review:
+                    for side, (x0, y0, x1, y1) in review["boxes"].items():
+                        cv2.rectangle(preview, (x0, y0), (x1, y1), (80, 230, 80), 2)
+                        text(preview, f"Your {side}: {review[side]}", x0, y0 - 8)
+                cv2.rectangle(preview, (0, 0), (preview.shape[1], 122), (0, 0, 0), -1)
+                text(preview, "Pose first, then press 1 BOTH OPEN / 2 BOTH CLOSED / 3 LEFT CLOSED / 4 RIGHT CLOSED", 12, 25)
+                text(preview, " | ".join(f"{pose} {counts[pose]}/10" for pose, _, _ in GUIDED_POSES.values()), 12, 52)
+                text(preview, f"Group {group} | G: new setup  Y: approve both eyes  N: discard  Q: quit", 12, 79)
+                text(preview, feedback, 12, 106)
+                cv2.imshow(window, preview)
+                key = cv2.waitKey(1) & 255
+                if key in (ord("q"), 27) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+                if review is None and key == ord("g") and group_has_samples:
+                    group += 1
+                    group_has_samples = False
+                    feedback = "New group. Use a different lighting or head-position setup."
+                elif review is None and key in GUIDED_POSES:
+                    pose, left, right = GUIDED_POSES[key]
+                    if counts[pose] >= 10:
+                        feedback = f"{pose} is complete. Select another pose."
+                        continue
+                    found = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
+                                                       data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+                    if not found.face_landmarks:
+                        feedback = "No face. Reposition and capture again."
+                        continue
+                    eyes = {side: extract_eye_roi(frame, found.face_landmarks[0], corners)
+                            for side, corners in EYE_CORNERS.items()}
+                    boxes = {side: box for side, (_, box) in eyes.items() if box is not None}
+                    started = time.monotonic_ns()
+                    if not guided_eye_order(boxes) or not 0 <= started - timestamp <= 1_000_000_000:
+                        feedback = "Eye bounds, orientation or capture age invalid. Retake."
+                        continue
+                    record = dict(frame_id=frame_id, capture_timestamp_ns=timestamp,
+                                  **{f"{side}_eye_roi": roi for side, (roi, _) in eyes.items()})
+                    captured_utc = datetime.fromtimestamp((time.time_ns() - (started - timestamp)) / 1e9,
+                                                         timezone.utc).isoformat()
+                    review = dict(frame=frame, boxes=boxes, record=record, started=started,
+                                  pose=pose, left=left, right=right, captured_utc=captured_utc)
+                    feedback = "Confirm both eye labels and sides on this frozen photo."
+                elif review and key == ord("n"):
+                    review = None
+                    feedback = "Discarded. Change position slightly and capture again."
+                elif review and key == ord("y"):
+                    photo_hash = hashlib.sha256(review["frame"].tobytes()).hexdigest()
+                    pair_hash = guided_pair_hash(review["record"])
+                    if photo_hash in known_photos or pair_hash in known_pairs:
+                        review = None
+                        feedback = "Duplicate frame or ROI pair. Change pose setup and retake."
+                        continue
+                    ok, png = cv2.imencode(".png", review["frame"])
+                    if not ok:
+                        raise DatasetError("Cannot encode original photograph")
+                    sample_id = uuid4().hex
+                    path = originals / f"{sample_id}.png"
+                    with path.open("xb") as handle:
+                        handle.write(png.tobytes())
+                    try:
+                        session.save_pair(review["record"], review["left"], review["right"], sample_id,
+                                          review_started_ns=review["started"])
+                    except BaseException:
+                        path.unlink()
+                        raise
+                    counts[review["pose"]] += 1
+                    group_has_samples = True
+                    report["samples"].append(dict(sample_id=sample_id, acquisition_group=f"{session_id}_{group}",
+                                                  pose=review["pose"], capture_utc_estimate=review["captured_utc"],
+                                                  original=path.relative_to(root).as_posix(), boxes=review["boxes"],
+                                                  image_sha256=photo_hash, roi_pair_sha256=pair_hash))
+                    write_json(root / "collection.json", report)
+                    known_photos.add(photo_hash)
+                    known_pairs.add(pair_hash)
+                    review = None
+                    feedback = "Saved. Change gaze, lighting or head position before the next shot."
+            validate_dataset(root)
+            report["complete"] = all(counts[pose] == 10 for pose, _, _ in GUIDED_POSES.values())
+            write_json(root / "collection.json", report)
+    finally:
+        stop.set()
+        cv2.destroyAllWindows()
+        if worker.ident is not None:
+            worker.join(2)
+            if worker.is_alive():
+                raise DatasetError("Camera release could not be confirmed")
+    print(json.dumps(dict(directory=str(root), complete=report["complete"], counts=counts)))
+    return 0 if report["complete"] else 1
+
+
 def collect_cli():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--subject-id", default="P001")
     parser.add_argument("--stop-file", type=Path)
+    parser.add_argument("--guided", choices=("development", "acceptance"),
+                        help="Record one manually reviewed session, ten distinct photos per pose")
     args = parser.parse_args()
+    if args.guided:
+        return collect_guided(args)
     root = args.data_dir.resolve()
     # A new directory is mandatory: do not append to or relabel an old holdout.
     root.mkdir(parents=True, exist_ok=False)

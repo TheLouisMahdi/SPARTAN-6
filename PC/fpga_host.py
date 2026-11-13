@@ -1,5 +1,6 @@
 """AX309 UART framing and the fixed TinyEye integer model image."""
 
+from binascii import crc_hqx
 from dataclasses import dataclass
 import struct
 import time
@@ -13,12 +14,7 @@ MAGIC = b"\xa5\x5a"
 
 
 def crc16(data):
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ (0x1021 if crc & 0x8000 else 0)) & 0xFFFF
-    return crc
+    return crc_hqx(data, 0xFFFF)
 
 
 def encode_packet(kind, sequence, payload=b""):

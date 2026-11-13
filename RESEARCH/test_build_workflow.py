@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,6 +13,27 @@ import rtl_evidence
 
 
 class BuildWorkflowTests(unittest.TestCase):
+    def test_bitgen_failure_empty_bit_and_resource_limit_cannot_pass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bit = Path(temporary) / "eye_top.bit"
+            fields = (b"eye_top\0", b"6slx9ftg256\0", b"2026/11/13\0", b"12:00:00\0")
+            payload = bytes.fromhex("ffffffffaa995566")
+            valid = bytes.fromhex("00090ff00ff00ff00ff0000001") + b"".join(
+                bytes([tag]) + struct.pack(">H", len(field)) + field for tag, field in zip(b"abcd", fields))
+            valid += b"e" + struct.pack(">I", len(payload)) + payload
+            result = dict(returncode=0, bitgen_returncode=0, timing_met=True, Fmax_MHz=51,
+                          LUT=4681, FF=3169, DSP48A1=2, BRAM18=3, BRAM9=2, slices=1402)
+            bit.write_bytes(b"")
+            self.assertEqual(rtl_evidence.build_status(result, "", bit), "FAIL")
+            bit.write_bytes(valid[:-1])
+            self.assertEqual(rtl_evidence.build_status(result, "", bit), "FAIL")
+            bit.write_bytes(valid)
+            self.assertEqual(rtl_evidence.build_status(result, "", bit), "PASS")
+            self.assertEqual(rtl_evidence.build_status(result, "FATAL_ERROR: BitGen", bit), "FAIL")
+            self.assertEqual(rtl_evidence.build_status(dict(result, bitgen_returncode=1), "", bit), "FAIL")
+            self.assertEqual(rtl_evidence.build_status(dict(result, Fmax_MHz=None), "", bit), "FAIL")
+            self.assertEqual(rtl_evidence.build_status(dict(result, BRAM18=32), "", bit), "DOES_NOT_FIT")
+
     def test_p1_can_be_selected_when_the_default_top_is_p2(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

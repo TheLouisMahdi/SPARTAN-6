@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 from time import time_ns
@@ -225,7 +226,7 @@ project set top eye_top
 project set {{Unused IOB Pins}} Float -process {{Generate Programming File}}
 project set {{FPGA Start-Up Clock}} {{JTAG Clock}} -process {{Generate Programming File}}
 project set {{UserID Code (8 Digit Hexadecimal)}} 41454545 -process {{Generate Programming File}}
-foreach step {{{{Synthesize - XST}} {{Implement Design}} {{Generate Programming File}}}} {{
+foreach step {{{{Synthesize - XST}} {{Implement Design}}}} {{
     if {{![process run $step]}} {{project close; error "Failed $step"}}
 }}
 project close
@@ -254,6 +255,44 @@ def build_canonical(ise=Path(r"C:\Xilinx\14.7\ISE_DS")):
     return _build_project(ROOT / "FPGA", 2, ise, "pretrained", 1000000, canonical=True)
 
 
+def valid_spartan6_bit(path):
+    """Check the Xilinx .bit container, target, payload length and sync word."""
+    try:
+        data = path.read_bytes()
+        if data[:13] != bytes.fromhex("00090ff00ff00ff00ff0000001"):
+            return False
+        pos = 13
+        for tag in b"abcd":
+            if data[pos] != tag:
+                return False
+            size = struct.unpack_from(">H", data, pos + 1)[0]
+            value = data[pos + 3:pos + 3 + size]
+            if not size or not value.endswith(b"\0"):
+                return False
+            if tag == ord("b") and value.lower() != b"6slx9ftg256\0":
+                return False
+            pos += size + 3
+        return (data[pos] == ord("e") and struct.unpack_from(">I", data, pos + 1)[0] == len(data) - pos - 5
+                and b"\xaa\x99\x55\x66" in data[pos + 5:pos + 69])
+    except (OSError, IndexError, struct.error):
+        return False
+
+
+def build_status(result, log, bit):
+    limits = {"LUT": 5720, "FF": 11440, "DSP48A1": 16, "BRAM18": 32, "BRAM9": 64, "slices": 1430}
+    counts = {name: result.get(name) for name in limits}
+    if any(type(value) is not int or value < 0 for value in counts.values()):
+        return "FAIL"
+    if any(counts[name] > limit for name, limit in limits.items()) or 2 * counts["BRAM18"] + counts["BRAM9"] > 64:
+        return "DOES_NOT_FIT"
+    if (result.get("returncode") == 0 and result.get("bitgen_returncode") == 0
+            and result.get("timing_met") is True and (result.get("Fmax_MHz") or 0) >= 50
+            and not re.search(r"FATAL_ERROR|^\s*ERROR:|Process [^\n]+ failed", log, re.I | re.M)
+            and valid_spartan6_bit(bit)):
+        return "PASS"
+    return "FAIL"
+
+
 def _build_project(output, pe_count, ise, network, baud, canonical=False):
     settings = Path(ise) / "settings64.bat"
     result = {"status": "NOT_RUN_MISSING_DEPENDENCY", "pe_count": pe_count, "tool": "ISE 14.7",
@@ -263,6 +302,9 @@ def _build_project(output, pe_count, ise, network, baud, canonical=False):
     result["source_sha256"] = {p.relative_to(ROOT / "FPGA").as_posix(): sha256(p)
         for folder in ("rtl", "generated") for p in sorted((ROOT / "FPGA" / folder).glob("*")) if p.is_file()}
     result["source_sha256"]["board_pins.ucf"] = sha256(ROOT / "FPGA/board_pins.ucf")
+    if not canonical:
+        result["implemented_source_sha256"] = {
+            name: sha256(output / name) for name in result["source_sha256"]}
     if settings.is_file():
         if not canonical:
             (output / "build.cmd").write_text(f'@echo off\r\ncall "{settings}"\r\nxtclsh build.tcl > build.log 2>&1\r\nexit /b %errorlevel%\r\n', encoding="ascii")
@@ -271,6 +313,18 @@ def _build_project(output, pe_count, ise, network, baud, canonical=False):
         env = dict(os.environ, ISE_SETTINGS=str(settings))
         process = subprocess.run(command, cwd=output, env=env, timeout=1800)
         result["returncode"] = process.returncode
+        if not canonical and process.returncode == 0 and (output / "eye_top.ncd").is_file():
+            # TinyEye starts with model_loaded=0 and UART uploads all coefficients.
+            # The activation RAM is populated by the controller and CNN before reads.
+            options = "-g INIT_9K:No " if network == "tiny" else ""
+            bitgen = [os.environ["COMSPEC"], "/d", "/c",
+                      f'call "{settings}" && bitgen -w -g StartUpClk:JtagClk -g UserID:41454545 '
+                      f'-g UnusedPin:PullNone {options}eye_top.ncd']
+            result["bitgen_command"] = bitgen
+            with (output / "bitgen.log").open("w") as log:
+                generated = subprocess.run(bitgen, cwd=output, env=env, stdout=log,
+                                           stderr=subprocess.STDOUT, timeout=120)
+            result["bitgen_returncode"] = generated.returncode
         report = output / "eye_top_map.mrp"
         if not report.exists():
             report = output / "eye_top.mrp"
@@ -282,7 +336,7 @@ def _build_project(output, pe_count, ise, network, baud, canonical=False):
                                "BRAM9": r"Number of RAMB8BWERs:\s*([\d,]+)",
                                "slices": r"Number of occupied Slices:\s*([\d,]+)"}.items():
             match = re.search(pattern, mapped)
-            result[field] = int(match[1].replace(",", "")) if match else None
+            result[field] = int(match[1].replace(",", "")) if match else (0 if field == "BRAM9" and mapped else None)
         timing_path = output / "eye_top.twr"
         timing = timing_path.read_text(errors="replace") if timing_path.exists() else ""
         period = re.search(r"Minimum period is\s*([\d.]+)ns", timing)
@@ -291,10 +345,11 @@ def _build_project(output, pe_count, ise, network, baud, canonical=False):
                       timing_met=int(errors[1]) == 0 if errors else None,
                       reports={p.name: sha256(p) for p in output.glob("*") if p.suffix in (".mrp", ".twr", ".syr")})
         log = "\n".join((output / name).read_text(errors="replace") for name in
-                        ("synthesize.log", "build.log", "generate_svf.log") if (output / name).is_file())
-        result["status"] = "PASS" if process.returncode == 0 and (output / "eye_top.bit").exists() and result["timing_met"] else (
-            "DOES_NOT_FIT" if re.search(r"overmapped|too many|exceeds.*available", log + mapped, re.I) else "FAIL")
-        if (output / "eye_top.bit").is_file():
+                        ("synthesize.log", "build.log", "bitgen.log", "generate_svf.log") if (output / name).is_file())
+        if canonical and 'Process "Generate Programming File" completed successfully' in log:
+            result["bitgen_returncode"] = 0  # Xilinx reports the child stage result in the canonical Tcl log.
+        result["status"] = build_status(result, log, output / "eye_top.bit")
+        if result["status"] == "PASS":
             result["bit_sha256"] = sha256(output / "eye_top.bit")
     if canonical:
         result["source_sha256"].update({name: sha256(output / name) for name in
@@ -491,6 +546,8 @@ def program_variant(output):
     sources = result.get("source_sha256", {})
     if not sources or any(sha256(ROOT / "FPGA" / name) != value for name, value in sources.items()):
         raise ValueError("FPGA sources changed since this build; rebuild before programming")
+    if not valid_spartan6_bit(output / "eye_top.bit"):
+        raise ValueError("Invalid Spartan-6 BIT container")
     script = output / "svf.cmd"
     script.write_text('setMode -bscan\nsetCable -port svf -file eye_top.svf\naddDevice -p 1 -file eye_top.bit\nprogram -p 1\nquit\n')
     (output / "svf_generate.cmd").write_text('@echo off\r\ncall C:\\Xilinx\\14.7\\ISE_DS\\settings64.bat\r\nimpact -batch svf.cmd > svf.log 2>&1\r\nexit /b %errorlevel%\r\n')

@@ -230,7 +230,8 @@ class DatasetSession:
             self._closed = True
             self._lock.__exit__(None, None, None)
 
-    def save_pair(self, record, left_label: str, right_label: str, sample_id: str | None = None) -> str:
+    def save_pair(self, record, left_label: str, right_label: str, sample_id: str | None = None,
+                  *, review_started_ns: int | None = None) -> str:
         if self._closed:
             raise DatasetError("Session is closed.")
         if record is None:
@@ -242,7 +243,10 @@ class DatasetSession:
             raise DatasetError("Invalid original frame metadata.")
         if frame_id in self.saved_frames:
             raise DatasetError("This frame has already been saved in this session.")
-        age_ms = (time.monotonic_ns() - timestamp) / 1_000_000
+        now = time.monotonic_ns()
+        if review_started_ns is not None and not timestamp <= review_started_ns <= now:
+            raise DatasetError("Invalid review timestamp.")
+        age_ms = ((now if review_started_ns is None else review_started_ns) - timestamp) / 1_000_000
         if not 0 <= age_ms <= FRESHNESS_LIMIT_MS:
             raise DatasetError(f"Frame is stale or has an invalid timestamp ({age_ms:.1f} ms).")
         sample_id = validate_identifier(uuid4().hex if sample_id is None else sample_id)

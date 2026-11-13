@@ -12,7 +12,7 @@ from unittest.mock import patch
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "PC"))
-from fpga_host import FPGAClient
+from fpga_host import FPGAClient, PacketReader, crc16, encode_packet
 from live_pipeline import EyePipeline, live_cli
 from pretrained_eye import PretrainedEye, read_model, input_pixels, prepare, DIRECTORY, canonical_logits, fixed_layers, network, OUTPUT_CONTRACT
 
@@ -95,6 +95,14 @@ class PretrainedTests(unittest.TestCase):
         with patch.object(client,"ping",return_value={"method_id":0,"model_loaded":False,"fingerprint":0}):
             with self.assertRaisesRegex(RuntimeError,"matching pretrained"):
                 client.load_model(self.model)
+
+    def test_uart_crc_wire_vectors(self):
+        self.assertEqual(crc16(b"123456789"), 0x29B1)
+        self.assertEqual(encode_packet(1, 1).hex(), "a55a01010100000000002c8b")
+        ping_reply = bytes.fromhex("a55a0181010000000c00000401c0414545450010aa4d9291")
+        reader = PacketReader()
+        self.assertEqual(reader.feed(ping_reply[:10]), [])
+        self.assertEqual(reader.feed(ping_reply[10:]), [(0x81, 1, ping_reply[10:-2])])
 
     def test_default_is_ready_without_devices(self):
         with redirect_stdout(io.StringIO()) as output:

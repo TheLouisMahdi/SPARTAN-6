@@ -39,16 +39,31 @@ def write_json(path, value):
 
 
 def metrics(actual, predicted):
-    matrix = np.bincount(np.asarray(actual, np.int64) * 2 + predicted, minlength=4).reshape(2, 2)
+    matrix = np.bincount(np.asarray(actual, np.int64) * 2 + np.asarray(predicted, np.int64),
+                         minlength=4).reshape(2, 2)
     recall = np.divide(matrix.diagonal(), matrix.sum(axis=1), out=np.zeros(2), where=matrix.sum(axis=1) != 0)
     precision = np.divide(matrix.diagonal(), matrix.sum(axis=0), out=np.zeros(2), where=matrix.sum(axis=0) != 0)
     f1 = np.divide(2 * precision * recall, precision + recall, out=np.zeros(2), where=precision + recall != 0)
-    return {"count": int(matrix.sum()), "accuracy": float(matrix.trace() / matrix.sum()),
+    tn, fp, fn, tp = map(int, matrix.ravel())
+    closed_denominator = 5 * tp + 4 * fn + fp
+    return {"count": int(matrix.sum()), "accuracy": float(matrix.trace() / matrix.sum()) if matrix.sum() else 0.0,
             "macro_f1": float(f1.mean()), "balanced_accuracy": float(recall.mean()),
+            "closed_f2": 5 * tp / closed_denominator if closed_denominator else 0.0,
             "confusion_matrix": matrix.tolist(), "matrix_order": ["OPEN", "CLOSED"],
             "per_class": {label: {"precision": float(precision[index]), "recall": float(recall[index]),
                                    "f1": float(f1[index]), "support": int(matrix[index].sum())}
                           for label, index in LABELS.items()}}
+
+
+def photo_checkpoint_rank(record, minimum_open_recall):
+    """Rank only validation records, retaining a diagnostic candidate if none qualifies."""
+    validation = record["validation"]
+    opened = validation["per_class"]["OPEN"]
+    closed = validation["per_class"]["CLOSED"]
+    eligible = (opened["support"] > 0 and closed["support"] > 0
+                and opened["recall"] >= minimum_open_recall and closed["recall"] > 0)
+    return (eligible, 0.0 if eligible else opened["recall"], validation["closed_f2"],
+            closed["recall"], -record["validation_loss"], -record["epoch"])
 
 
 def load_pixels(bundle_dir, method, split, count):
@@ -86,7 +101,8 @@ def state_hash(model):
     return digest.hexdigest()
 
 
-def fit_one(directory, method, seed, pixels, partitions, args, device, encoder=None):
+def fit_one(directory, method, seed, pixels, partitions, args, device, encoder=None, *, personal_photos=False,
+            photo_preprocess=None):
     encoder = METHODS[method] if encoder is None else encoder
     if directory.exists():
         if args.resume and (directory / "fit.json").is_file():
@@ -105,9 +121,15 @@ def fit_one(directory, method, seed, pixels, partitions, args, device, encoder=N
     y = targets(partitions["train"])
     counts = np.bincount(y, minlength=2)
     weights = len(y) / (2 * counts)
+    if personal_photos and args.loss == "closed3":
+        weights = [1.0, 3.0]
+    weights = np.asarray(weights)
     criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=device))
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    x_train, x_val = (tensor_pixels(pixels[split], device) for split in ("train", "val"))
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate,
+                                 weight_decay=0.0001 if personal_photos else 0)
+    clean_pixels = ({split: photo_preprocess(source) for split, source in pixels.items()}
+                    if photo_preprocess is not None else pixels)
+    x_train, x_val = (tensor_pixels(clean_pixels[split], device) for split in ("train", "val"))
     y_train = torch.from_numpy(y).to(device)
     y_val = targets(partitions["val"])
     history, best_score, best_epoch = [], -1.0, None
@@ -120,20 +142,38 @@ def fit_one(directory, method, seed, pixels, partitions, args, device, encoder=N
         for offset in range(0, len(y), args.batch_size):
             indices = permutation[offset:offset + args.batch_size]
             optimizer.zero_grad(set_to_none=True)
-            loss = criterion(model(x_train[indices]), y_train[indices])
+            if personal_photos:
+                augmented = augment_photo_eyes(pixels["train"][indices.cpu().numpy()], rng)
+                if photo_preprocess is not None:
+                    augmented = photo_preprocess(augmented)
+                batch = tensor_pixels(augmented, device)
+            else:
+                batch = x_train[indices]
+            loss = criterion(model(batch), y_train[indices])
             loss.backward()
             optimizer.step()
             losses.append(loss.detach())
         train_loss = float(torch.stack(losses).mean())
         logits = float_logits(model, x_val, args.batch_size)
         val = metrics(y_val, logits.argmax(axis=1))
-        history.append({"epoch": epoch, "mean_batch_weighted_train_loss": train_loss, "validation": val})
-        if val["macro_f1"] > best_score:
-            best_score, best_epoch = val["macro_f1"], epoch
+        record = {"epoch": epoch, "mean_batch_weighted_train_loss": train_loss, "validation": val}
+        score = val["macro_f1"]
+        if personal_photos:
+            # A common unweighted loss makes the tie-break comparable across objectives.
+            record["validation_loss"] = float(torch.nn.functional.cross_entropy(
+                torch.from_numpy(logits).to(device), torch.from_numpy(y_val).to(device)))
+            score = photo_checkpoint_rank(record, args.minimum_open_recall)
+        history.append(record)
+        if best_epoch is None or score > best_score:
+            best_score, best_epoch = score, epoch
             torch.save({"state_dict": model.state_dict(), "method": method,
                         "encoder_version": encoder.SPEC["version"], "seed": seed,
                         "epoch": epoch, "architecture": ARCHITECTURE}, stage / "float32.pt")
         print(f"{method} seed={seed} epoch={epoch}/{args.epochs} loss={train_loss:.4f} val_macro_f1={val['macro_f1']:.4f}", flush=True)
+        # A diagnostic fallback is not a viable checkpoint and must not
+        # exhaust patience before the model has learned both classes.
+        if personal_photos and best_score[0] and epoch - best_epoch >= 10:
+            break
     checkpoint = torch.load(stage / "float32.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["state_dict"])
     # Shared index policy per seed. This set is sampled only from TRAIN, without labels.
@@ -143,12 +183,17 @@ def fit_one(directory, method, seed, pixels, partitions, args, device, encoder=N
     integer_model.save_parameters(stage, params, quantization)
     np.save(stage / "calibration_train_indices.npy", calibration_indices, allow_pickle=False)
     info = {"method": method, "seed": seed, "initial_state_sha256": initial_hash,
-            "selected_epoch": best_epoch, "selected_validation_macro_f1": best_score,
-            "selection": "Maximum validation macro F1, earliest epoch on a tie; no threshold search",
+            "selected_epoch": best_epoch, "selected_validation_macro_f1": history[best_epoch - 1]["validation"]["macro_f1"],
+            "selection": ("Validation OPEN recall gate and nonzero CLOSED recall, then CLOSED F2, "
+                          "CLOSED recall, unweighted validation loss, earliest epoch"
+                          if personal_photos else "Maximum validation macro F1, earliest epoch on a tie; no threshold search"),
             "train_class_counts_OPEN_CLOSED": counts.tolist(), "class_weights_OPEN_CLOSED": weights.tolist(),
             "history": history, "fit_and_calibration_seconds": time.perf_counter() - start,
             "float32_sha256": sha256(stage / "float32.pt"),
             "int8_sha256": sha256(stage / "int8_parameters.npz")}
+    if personal_photos:
+        info.update(loss=args.loss, minimum_open_recall=args.minimum_open_recall,
+                    selected_validation_eligible=best_score[0])
     write_json(stage / "fit.json", info)
     stage.rename(directory)
 
@@ -189,6 +234,123 @@ def evaluate_one(directory, method, pixels, partitions, args, device):
         print(f"EVAL {method} seed={checkpoint['seed']} {split}: FP32 F1={result['float32']['macro_f1']:.4f}, INT8 F1={result['int8']['macro_f1']:.4f}", flush=True)
     write_json(directory / "evaluation.json", report)
     return report
+
+
+def augment_photo_eyes(pixels, rng):
+    import cv2
+
+    batch = np.empty_like(pixels)
+    for index, roi in enumerate(pixels[:, 0]):
+        transform = cv2.getRotationMatrix2D((15.5, 7.5), float(rng.uniform(-5, 5)), 1)
+        transform[:, 2] += rng.uniform(-1, 1, size=2)
+        moved = cv2.warpAffine(roi, transform, (32, 16), borderMode=cv2.BORDER_REPLICATE)
+        adjusted = moved.astype(np.float32) * rng.uniform(0.85, 1.15) + rng.uniform(-10, 10)
+        batch[index, 0] = np.clip(np.rint(adjusted), 0, 255).astype(np.uint8)
+    return batch
+
+
+def personal_photos_cli():
+    import cv2
+    from capture import EYE_CORNERS, MODEL_PATH, extract_eye_roi, mp, vision
+    from live_pipeline import read_parameters
+    from fpga_host import model_image
+
+    parser = argparse.ArgumentParser(description="Train TinyEye Grayscale8 on the four labelled photo bursts.")
+    parser.add_argument("--photos", type=Path, default=ASSETS / "data/train_data")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--minimum-open-recall", type=float, default=0.95)
+    args = parser.parse_args()
+    if not 0 < args.minimum_open_recall <= 1:
+        parser.error("--minimum-open-recall must be greater than zero and at most one")
+    # Each folder is one acquisition burst. The two unilateral bursts each
+    # contain both classes and exercise opposite sides in validation and test.
+    groups = {"BOTH_OPEN": ("train", ("OPEN", "OPEN"), 9),
+              "BOTH_CLOSED": ("train", ("CLOSED", "CLOSED"), 7),
+              "LEFT_CLOSED": ("val", ("CLOSED", "OPEN"), 8),
+              "RIGHT_CLOSED": ("test", ("OPEN", "CLOSED"), 9)}
+    partitions = {split: [] for split in ("train", "val", "test")}
+    pixels = {split: [] for split in partitions}
+    seen = set()
+    options = vision.FaceLandmarkerOptions(base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH)),
+                                          running_mode=vision.RunningMode.IMAGE, num_faces=1)
+    with vision.FaceLandmarker.create_from_options(options) as landmarker:
+        for pose, (split, labels, expected) in groups.items():
+            photos = sorted(path for path in (args.photos / pose).iterdir()
+                            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png"})
+            if len(photos) != expected:
+                raise ValueError(f"{pose}: expected {expected} photos, found {len(photos)}")
+            for photo in photos:
+                data = photo.read_bytes()
+                digest = hashlib.sha256(data).hexdigest()
+                if digest in seen:
+                    raise ValueError(f"Duplicate photograph: {photo}")
+                seen.add(digest)
+                frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                if frame is None:
+                    raise ValueError(f"Unreadable photograph: {photo}")
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                found = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+                if len(found.face_landmarks) != 1:
+                    raise ValueError(f"Expected one face: {photo}")
+                for (side, corners), label in zip(EYE_CORNERS.items(), labels):
+                    roi, box = extract_eye_roi(frame, found.face_landmarks[0], corners)
+                    if roi is None:
+                        raise ValueError(f"Missing {side} ROI: {photo}")
+                    pixels[split].append(METHODS["grayscale8"].encode(roi)[None])
+                    partitions[split].append(dict(label=label, subject_id="operator", side=side, pose=pose,
+                                                  photo=photo.relative_to(args.photos).as_posix(),
+                                                  sha256=digest, box=box))
+    pixels = {split: np.stack(values) for split, values in pixels.items()}
+    args.resume = False
+    args.epochs, args.batch_size, args.learning_rate = 60, 8, 0.001
+    args.evaluation_splits = ("val", "test")
+    torch.set_num_threads(4)
+    torch.use_deterministic_algorithms(True)
+    device = torch.device("cpu")
+    args.output.mkdir(parents=True, exist_ok=False)
+    fits = {}
+    for loss in ("balanced", "closed3"):
+        args.loss = loss
+        directory = args.output / loss
+        fit_one(directory, "grayscale8", 42,
+                {split: pixels[split] for split in ("train", "val")},
+                {split: partitions[split] for split in ("train", "val")},
+                args, device, personal_photos=True)
+        fit = json.loads((directory / "fit.json").read_text(encoding="utf-8"))
+        selected = fit["history"][fit["selected_epoch"] - 1]
+        fits[loss] = dict(validation=selected, int8_sha256=fit["int8_sha256"],
+                          float32_sha256=fit["float32_sha256"], eligible=fit["selected_validation_eligible"])
+    eligible = [loss for loss, fit in fits.items() if fit["eligible"]]
+    winner = max(eligible, key=lambda loss: photo_checkpoint_rank(
+        fits[loss]["validation"], args.minimum_open_recall)) if eligible else None
+    write_json(args.output / "selection_frozen.json",
+               dict(selection_scope="FP32 validation only", minimum_open_recall=args.minimum_open_recall,
+                    selected=winner, candidates=fits, activated=False))
+    comparisons = {}
+    class_names = ("OPEN", "CLOSED")
+    for loss in fits:
+        directory = args.output / loss
+        report = evaluate_one(directory, "grayscale8", pixels, partitions, args, device)
+        image = model_image(read_parameters(directory / "int8_parameters.npz"))
+        flips = {}
+        for split in report:
+            with np.load(directory / f"{split}_predictions.npz", allow_pickle=False) as scores:
+                fp32, int8 = (scores[key].argmax(axis=1) for key in ("float_logits", "int32_logits"))
+                flips[split] = [dict(row, fp32=class_names[fp], int8=class_names[quantized])
+                                for row, fp, quantized in zip(partitions[split], fp32, int8)
+                                if fp != quantized]
+        comparisons[loss] = dict(evaluation=report, quantization_decision_changes=flips,
+                                 serialized_coefficient_bytes=len(image),
+                                 serialized_coefficient_sha256=hashlib.sha256(image).hexdigest())
+    write_json(args.output / "photo_validation.json",
+               dict(scope="Single acquisition session; test burst previously inspected, comparison only",
+                    groups=groups, observations=partitions, comparisons=comparisons, selected=winner,
+                    training=dict(seed=42, epochs=60, patience=10, batch_size=8, learning_rate=0.001,
+                                  weight_decay=0.0001, brightness_scale=[0.85, 1.15],
+                                  brightness_offset=[-10, 10], translation_pixels=1, rotation_degrees=5),
+                    activated=False))
+    print(json.dumps(dict(output=str(args.output), selected=winner, activated=False)))
+    return int(winner is None)
 
 
 def run(args, encoders=None):

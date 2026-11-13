@@ -4,10 +4,12 @@
 /datasets/
 /data/
 /runs/
+/builds/
 /logs/
 /deployment/
 /models/face_landmarker.task
 /models/demo_deployment.json
+/models/tinyeye_grayscale8_photos_v1/
 /models/**/*.npz
 /models/**/*.pt
 /models/**/*.bit

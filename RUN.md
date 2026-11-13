@@ -45,6 +45,15 @@ Invoke-WebRequest 'https://storage.googleapis.com/mediapipe-models/face_landmark
 
 ## ۳. اجرای FPGA از طریق UART
 
+برای راه‌اندازی مستقل Pretrained FPGA، ابتدا ارتباط COM را بررسی کنید، سپس در صورت نیاز FPGA را موقتاً برنامه‌ریزی و وب‌کم را اجرا کنید:
+
+```powershell
+.\Start-SPARTAN.ps1 -Mode check -Port COM26 -Camera 0
+.\Start-SPARTAN.ps1 -Mode all -Port COM26 -Camera 0
+```
+
+دستور `check` فقط وضعیت UART را بررسی می‌کند. دستور `all` در صورت نیاز JTAG را برنامه‌ریزی می‌کند و **پیکربندی قبلی را به‌صورت خودکار بازنمی‌گرداند**. پورت واقعی را جایگزین `COM26` کنید. برای خروج از وب‌کم `Q` یا `Esc` را بزنید.
+
 برای ساخت تصویر FPGA به Xilinx ISE 14.7 و برای بارگذاری موقت از طریق کابل JTAG به Vivado/XSDB 2023.2 نیاز است. اگر برد از قبل firmware سازگار دارد، مستقیم به اجرای وب‌کم بروید.
 
 ```powershell
