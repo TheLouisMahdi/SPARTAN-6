@@ -1,9 +1,8 @@
 # Validation record
 
-Current final-project status: **PARTIALLY_READY**. The 2026-11-06 streaming
-acceptance below is source/physical-ROI validated; a complete live eye-classifier
-demo is blocked by the observed camera input. No public push is implied by a
-validation result; publication has its own recorded commit/branch check.
+Current scope is offline physical ROI inference and bounded streaming evaluation.
+The micro-batch optimization is governed by the resource and correctness gates in
+[STREAMING_MICROBATCH.md](STREAMING_MICROBATCH.md). Publication is a separate action.
 
 This document summarizes existing evidence. Repository cleanup performs offline
 regressions only; it does not program, reset or contact the connected board.
@@ -134,29 +133,6 @@ very small post-ROI CPU work, and desktop/USB scheduling variation remains.
 This is one paired ROI benchmark, not a statistically rigorous speedup estimate
 or a measurement of the complete camera/MediaPipe path.
 
-### Live camera and stability limits
-
-Three GUI trials per mode completed 63 seconds each (3 seconds warmup), with
-1,910 captured frames per trial. All returned no valid bilateral eye ROIs and no
-CNN pair submissions. A further overlapped headless runtime stability test
-completed **300.214 measured seconds**, with 9,183 captured/prepared/published
-frames, no worker/CRC/sequence errors or normal-path timeouts, and clean shutdown.
-This establishes runtime behavior on invalid observations, not continuous valid
-CNN inference or successful live recognition. Useful live throughput and live
-speedup are **NOT_AVAILABLE**; zero submitted pairs must not masquerade as success.
-
-A post-test diagnostic read 20 actual 1280x720 BGR camera frames. MediaPipe found
-zero faces; mean pixel intensity ranged from 0 to 1.414/255. The almost-black
-camera input must be corrected and a visible face supplied before live acceptance.
-No privacy-shutter/exposure cause was assumed or changed. No camera images were saved.
-
-GUI event loops were pumped and native resources closed. Startup-inclusive maximum
-poll gap reached 338 ms in the first sequential trial; other trial maxima were
-about 49-62 ms. Working set was observed rather than inferred from queue counters:
-after the first 15 seconds of stability, it grew from 167,067,648 to 175,304,704
-bytes (+8,237,056 bytes). Bounded queues were verified, but this finite observation
-does not establish indefinite leak-free behavior of native camera/MediaPipe allocators.
-
 ### Acceptance interpretation
 
 Final source regression: **119 Python tests run, 118 passed, one pre-existing
@@ -173,7 +149,6 @@ coefficients, constraints and the verified BIT were unchanged.
 Repository integrity, deterministic worker tests, numerical correctness, physical
 P2 inference and controlled post-ROI comparison are supported by evidence.
 Physical request overlap and a labelled kernel-overlap bound are supported for
-ROI_REPLAY_ONLY. Full camera/MediaPipe plus valid FPGA inference and real blink/
-head-movement/reacquisition behavior remain blocked/not available. Therefore
-**READY_FOR_BACHELOR_DEMO is not claimed**. Correct the camera scene/input, then
-repeat live acceptance; do not alter weights or ROI geometry to manufacture success.
+ROI_REPLAY_ONLY. The current optimization scope uses offline inputs exclusively.
+Historical runtime records remain unchanged in their original ignored run folders;
+they are not acceptance evidence for the new streaming optimization.
