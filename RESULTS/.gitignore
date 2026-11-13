@@ -1,0 +1,9 @@
+# Runtime output and locally downloaded data only.
+/runtime/
+/tools/
+/datasets/
+/data/
+/runs/
+/logs/
+/models/face_landmarker.task
+/models/demo_deployment.json

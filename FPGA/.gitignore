@@ -1,0 +1,11 @@
+/output/
+/_ngo/
+/_xmsgs/
+/iseconfig/
+/xst/
+/eye_top.bit
+/eye_top.mcs
+/eye_top_summary.html
+/*.log
+/webtalk*
+/*usage_statistics*.html
