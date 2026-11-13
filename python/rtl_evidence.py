@@ -408,10 +408,13 @@ def board_suite(output, port="COM26"):
     return result
 
 
-def program_svf(svf, output):
+def program_svf(svf, output, expected_usercode=0x41454545):
     """Play an ISE-generated SVF using the retained Xilinx cable transport; never synthesize with Vivado."""
     import socket
     import time
+    if not isinstance(expected_usercode, int) or not 0 <= expected_usercode <= 0xffffffff:
+        raise ValueError("Expected USERCODE must be an explicit uint32")
+    usercode_label = "AEEE" if expected_usercode == 0x41454545 else f"{expected_usercode:08X}"
     svf, output = Path(svf).resolve(), Path(output).resolve()
     if not svf.is_file():
         raise FileNotFoundError(svf)
@@ -442,7 +445,7 @@ set devices {{}}
 foreach target [jtag targets -target-properties] {{
     if {{[dict exists $target is_fpga] && [dict get $target is_fpga]}} {{lappend devices $target}}
 }}
-if {{[llength $devices]!=1 || [dict get [lindex $devices 0] name] ne "xc6slx9"}} {{error {{Expected one XC6SLX9}}}}
+if {{[llength $devices]!=1 || [dict get [lindex $devices 0] name] ne "xc6slx9" || [dict get [lindex $devices 0] idcode] ne "24001093" || [dict get [lindex $devices 0] irlen]!=6}} {{error {{Expected one verified XC6SLX9}}}}
 jtag targets -set -filter {{name == "xc6slx9"}}
 jtag lock 10000
 source {{{player}}}
@@ -453,9 +456,9 @@ $sequence irshift -state IDLE -capture -integer 6 8
 $sequence drshift -state IDLE -capture -tdi 0 32
 set result [$sequence run -integer]
 $sequence delete
-if {{([lindex $result 0]&32)==0 || [lindex $result 1]!=0x41454545}} {{error {{DONE/USERCODE verification failed}}}}
+if {{([lindex $result 0]&32)==0 || [lindex $result 1]!=0x{expected_usercode:08X}}} {{error {{DONE/USERCODE verification failed}}}}
 jtag unlock
-puts {{PROGRAM_PASS DONE USERCODE_AEEE}}
+puts {{PROGRAM_PASS DONE USERCODE_{usercode_label}}}
 }}
 if {{[catch {{main}} message options]}} {{catch {{jtag unlock}};puts stderr [dict get $options -errorinfo];exit 1}}
 exit 0
@@ -466,7 +469,8 @@ exit 0
         process = subprocess.run(command, cwd=output, stdout=log, stderr=subprocess.STDOUT, timeout=120)
     log = (output / "program.log").read_text(errors="replace")
     result = {"status": "PASS" if process.returncode == 0 and "PROGRAM_PASS" in log else "FAIL",
-              "svf_sha256": sha256(svf), "command": command, "returncode": process.returncode}
+              "svf_sha256": sha256(svf), "expected_usercode": expected_usercode,
+              "command": command, "returncode": process.returncode}
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 

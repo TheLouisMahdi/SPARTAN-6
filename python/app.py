@@ -1265,7 +1265,7 @@ def hardware_cli(action):
 
 def main():
     """Start the pinned pretrained classifier; archived research remains explicit."""
-    commands = ("live", "compare", "experiment", "dataset", "session-report", "test-all", "model", "fpga", "host", "baseline", "replay", "predict", "capture", "collect", "build", "program",
+    commands = ("demo", "live", "compare", "experiment", "dataset", "session-report", "test-all", "model", "fpga", "host", "baseline", "replay", "predict", "capture", "collect", "build", "program",
                 "prepare", "import", "encode", "train", "personal", "ablation", "events", "evidence", "rtl", "pretrained")
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         parser = argparse.ArgumentParser(description=__doc__)
@@ -1274,6 +1274,9 @@ def main():
         print("Use COMMAND --help for that command's options.")
         return 0
     command = sys.argv.pop(1) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "live"
+    if command == "demo":
+        from demo import main as demo_main
+        return demo_main()
     if command == "experiment":
         from experiment import experiment_cli
         return experiment_cli()

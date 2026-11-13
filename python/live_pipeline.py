@@ -142,7 +142,10 @@ class EyePipeline:
                     hardware = self.client.infer_pretrained(*(available[side] for side in SIDES), frame_id)
                 else:
                     codes = [self._codes(available[side]) for side in SIDES]
-                    hardware = self.client.infer(self.model.method, *codes, frame_id)
+                    if getattr(self.client,"supports_capture_ns",False):
+                        hardware = self.client.infer(self.model.method, *codes, frame_id, capture_ns=capture_ns)
+                    else:
+                        hardware = self.client.infer(self.model.method, *codes, frame_id)
                 hardware_cycles = (hardware.left_cycles, hardware.right_cycles, hardware.pair_cycles)
                 scores = dict(zip(SIDES, (hardware.left_logits, hardware.right_logits)))
                 if self.verify:
@@ -236,7 +239,26 @@ def model_cli(argv=None):
         parser.exit(1, f"MODEL ERROR: {exc}\n")
 
 
-def run_streaming(args, model):
+def render_stream_preview(snapshot, now_ns, counts, first_capture_ns, mode):
+    """Render an owned frame without opening a window, camera or landmarker."""
+    import cv2
+    item=snapshot.inference.prepared; display=item.frame.copy()
+    expired=now_ns-item.capture_ns>MAXIMUM_GAP_MS*1000000
+    for side,box in item.boxes.items():
+        x0,y0,x1,y1=box; cv2.rectangle(display,(x0,y0),(x1,y1),(80,180,180),1)
+    elapsed=max(.001,(now_ns-first_capture_ns)/1e9)
+    kernel=(snapshot.inference.hardware.left_cycles+snapshot.inference.hardware.right_cycles)/50000 if snapshot.inference.hardware else None
+    lines=['SPARTAN-6 | CPU-FPGA PIPELINE',f'Backend FPGA P2 | {mode.upper()} | frame {item.frame_id}',
+        ' | '.join(s+': '+('UNAVAILABLE' if expired else snapshot.eyes[s]['state']) for s in SIDES),
+        f'Prep {(item.prep_end_ns-item.prep_start_ns)/1e6:.2f} ms | Transport {(snapshot.inference.end_ns-snapshot.inference.start_ns)/1e6:.2f} ms',
+        f'Age {(now_ns-item.capture_ns)/1e6:.1f} ms | blinks {snapshot.timing.count}',
+        f'Capture {counts.get("capture",0)/elapsed:.1f} FPS | processed {counts.get("fpga_completed",0)/elapsed:.2f} FPS',
+        f'Kernel pair {kernel} ms | prep drops {counts.get("dropped_preparation",0)} | RUNNING {snapshot.reason or ""}']
+    for n,line in enumerate(lines): cv2.putText(display,line,(8,25+22*n),cv2.FONT_HERSHEY_SIMPLEX,.5,(100,235,180),1,cv2.LINE_AA)
+    return display
+
+
+def run_streaming(args, model, client_factory=None):
     """The GUI remains on the caller. All UART activity belongs to eye-fpga."""
     import csv
     from dataclasses import asdict
@@ -250,6 +272,7 @@ def run_streaming(args, model):
     from collections import deque
     from pipeline_report import summarize
     from experiment import write_json
+    from bounded_log import BoundedLog
     report=args.report
     if report == ROOT/'assets/logs/live/latest.json':
         report=ROOT/'assets/runs'/('pipeline_'+args.pipeline+'_'+uuid4().hex[:12])/'session.json'
@@ -258,12 +281,27 @@ def run_streaming(args, model):
         raise FileExistsError('Pipeline outputs must be new; existing reports are preserved')
     directory.mkdir(parents=True,exist_ok=True)
     if args.frames: args.frames.parent.mkdir(parents=True,exist_ok=True)
-    trace=(directory/'trace.jsonl').open('x',encoding='utf-8',buffering=65536)
     replay_rows=[]
+    pretrained = model.method == 'omz_bgr32'
+    capture_capacity = 1 if pretrained else 2
     if args.replay_manifest:
         from public_data import read_cew_manifest
         replay_rows=sorted(read_cew_manifest(args.replay_manifest),key=lambda r:r['source_sha256'])[:args.replay_count*2]
         if len(replay_rows)<args.replay_count*2: raise ValueError('Insufficient registered replay inputs')
+    replay_frames=[]; replay_preload_ms=0
+    if replay_rows:
+        from experiment import read_color_image
+        from data_tools import sha256
+        preload_start=time.perf_counter_ns()
+        for i in range(args.replay_count):
+            pair=[]
+            for row in replay_rows[2*i:2*i+2]:
+                if sha256(Path(row['source_path']))!=row['source_sha256']: raise ValueError('Replay source hash changed')
+                image,_=read_color_image(row['source_path'])
+                pair.append(cv2.resize(image,(32,32),interpolation=cv2.INTER_LINEAR) if pretrained else
+                            cv2.resize(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY),(32,16),interpolation=cv2.INTER_AREA))
+            fixture=np.concatenate(pair,axis=1);fixture.flags.writeable=False;replay_frames.append(fixture)
+        replay_preload_ms=(time.perf_counter_ns()-preload_start)/1e6
     class Prepare:
         def __init__(self):
             self.landmarker=None
@@ -281,33 +319,28 @@ def run_streaming(args, model):
                 rois,boxes={},{}
                 if found.face_landmarks:
                     for side,corners in EYE_CORNERS.items():
-                        _,box=extract_eye_roi(frame,found.face_landmarks[0],corners)
+                        gray,box=extract_eye_roi(frame,found.face_landmarks[0],corners)
                         if box is not None:
-                            x0,y0,x1,y1=box; boxes[side]=box; rois[side]=frame[y0:y1,x0:x1].copy()
+                            x0,y0,x1,y1=box; boxes[side]=box; rois[side]=frame[y0:y1,x0:x1].copy() if pretrained else gray
                 pipe.record('preparation_components',capture_ns=capture_ns,landmark_start_ns=start,landmark_end_ns=landmark_end,roi_end_ns=time.perf_counter_ns())
-            from pretrained_eye import input_pixels
             # Identical BGR interpolation is performed before handing work to UART.
-            rois={s:np.ascontiguousarray(input_pixels(roi).transpose(1,2,0)) for s,roi in rois.items()}
+            if pretrained:
+                from pretrained_eye import input_pixels
+                rois={s:np.ascontiguousarray(input_pixels(roi).transpose(1,2,0)) for s,roi in rois.items()}
             return rois,boxes
         def close(self):
             if self.landmarker is not None: self.landmarker.close()
     def source(stop):
         if replay_rows:
-            from experiment import read_color_image
-            from data_tools import sha256
-            pending,errors=Queue(1),Queue(1);ended=Event()
+            pending,errors=Queue(capture_capacity),Queue(1);ended=Event()
             def produce():
-                start=time.perf_counter()
+                start=time.perf_counter_ns()
                 try:
                     for i in range(args.replay_count):
-                        if stop.wait(max(0,start+i/args.replay_fps-time.perf_counter())): break
-                        pair=[]
-                        for row in replay_rows[2*i:2*i+2]:
-                            if sha256(Path(row['source_path']))!=row['source_sha256']: raise ValueError('Replay source hash changed')
-                            image,_=read_color_image(row['source_path']); pair.append(cv2.resize(image,(32,32),interpolation=cv2.INTER_LINEAR))
-                        captured=time.perf_counter_ns()
+                        captured=start+round(i*1e9/args.replay_fps)
+                        if stop.wait(max(0,(captured-time.perf_counter_ns())/1e9)): break
                         pipe.record('capture',frame_id=i+1,capture_ns=captured,source_ids=[r['sample_id'] for r in replay_rows[2*i:2*i+2]])
-                        old=offer_latest(pending,(i+1,captured,np.concatenate(pair,axis=1)))
+                        old=offer_latest(pending,(i+1,captured,replay_frames[i]))
                         if old is not None:pipe.record('dropped_capture',frame_id=old[0],reason='ROI replay latest-frame')
                 except Exception as exc: errors.put_nowait(exc)
                 finally: ended.set()
@@ -325,7 +358,7 @@ def run_streaming(args, model):
                 if worker.is_alive():raise RuntimeError('ROI source did not close')
                 while not pending.empty():pipe.record('dropped_capture',frame_id=pending.get_nowait()[0],reason='shutdown')
             return
-        pending,errors=Queue(1),Queue(1); stopped=Event()
+        pending,errors=Queue(capture_capacity),Queue(1); stopped=Event()
         worker=Thread(target=capture_frames,args=(pending,errors,stop,stopped,args.camera,
             lambda fid,ns:pipe.record('capture',frame_id=fid,capture_ns=ns),
             lambda fid,reason:pipe.record('dropped_capture',frame_id=fid,reason=reason),time.perf_counter_ns),name='camera-capture',daemon=True)
@@ -340,15 +373,17 @@ def run_streaming(args, model):
             stop.set(); worker.join(3)
             if worker.is_alive(): raise RuntimeError('Camera release did not complete')
             while not pending.empty(): pipe.record('dropped_capture',frame_id=pending.get_nowait()[0],reason='shutdown')
-    def emit(event): trace.write(json.dumps(event)+'\n')
-    pipe=StreamingPipeline(source,Prepare,lambda:FPGAClient(args.port,baud=args.baud or 1000000),model,
-        mode=args.pipeline,verify=args.verify,emit=emit)
+    def emit(event): trace.write(event)
+    startup_timeout = 75 if client_factory is not None else 5
+    pipe=StreamingPipeline(source,Prepare,client_factory or (lambda:FPGAClient(args.port,baud=args.baud or 1000000)),model,
+        mode=args.pipeline,verify=args.verify,emit=emit,startup_timeout=startup_timeout,prepared_capacity=1 if pretrained else 4)
     meta=dict(schema_version=1,report_kind='stream_pipeline_v1',mode=args.pipeline,source='ROI_REPLAY_ONLY' if replay_rows else 'LIVE_CAMERA_MEDIAPIPE',
         provenance='PHYSICAL_MEASUREMENT',model_sha256=model.checkpoint_sha256,output_order=['OPEN','CLOSED'],
         source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
         dirty_status=subprocess.check_output(['git','status','--short'],cwd=ROOT,text=True),
-        bitstream_sha256_local_artifact=hashlib.sha256((ROOT/'fpga/eye_top.bit').read_bytes()).hexdigest() if (ROOT/'fpga/eye_top.bit').exists() else None,
-        bitstream_provenance='Local artifact hash; reused running firmware must additionally match fingerprint and P2 golden cycles',
+        bitstream_sha256_local_artifact=(getattr(client_factory,'deployment',{}).get('bit',{}).get('sha256') or
+            (hashlib.sha256((ROOT/'fpga/eye_top.bit').read_bytes()).hexdigest() if (ROOT/'fpga/eye_top.bit').exists() else None)),
+        bitstream_provenance='Deployment digest with startup arithmetic/readback gates when supplied; otherwise local artifact only',
         port=args.port,baud=args.baud or 1000000,camera=None if replay_rows else args.camera,verify=args.verify,
         warmup_seconds=args.warmup_seconds,start_ns=time.perf_counter_ns(),status='PASS',timing_source='CPU BinocularTimer; onboard diagnostic available through legacy mode',
         gui=not args.headless,frames_path=str(args.frames or directory/'frames.csv'),images_saved=False,
@@ -356,14 +391,17 @@ def run_streaming(args, model):
         requested_seconds=args.seconds)
     meta.update(source_sha256={name:hashlib.sha256((ROOT/'python'/name).read_bytes()).hexdigest()
         for name in ('live_pipeline.py','stream_pipeline.py','capture.py','fpga_host.py','pretrained_eye.py')},
-        queue_capacities=dict(capture=1,prepared=1,inference=2,display=1),serial_owner='eye-fpga',
+        queue_capacities=dict(capture=capture_capacity,prepared=pipe.prepared.maxsize,inference=2,display=1),serial_owner='eye-fpga',
         preparation_owner='eye-prepare',result_owner='eye-result',process_id=__import__('os').getpid())
     if args.replay_manifest:
         meta.update(replay_manifest_sha256=hashlib.sha256(args.replay_manifest.read_bytes()).hexdigest(),
-            replay_count=args.replay_count,replay_fps=args.replay_fps,replay_selection='Source SHA256 order; first 2*count eye patches; no label/model-based selection')
+            replay_count=args.replay_count,replay_fps=args.replay_fps,replay_preload_ms=replay_preload_ms,fixture_preload_bytes=sum(frame.nbytes for frame in replay_frames),
+            replay_timestamp_definition='synthetic fixed-rate capture epoch; trace at_ns records actual dispatch, including scheduler lateness',
+            replay_selection='Source SHA256 order; first 2*count eye patches; no label/model-based selection')
     exit_code=0; first_capture=None; duration_completed=False; ui_polls=0; ui_last=None; ui_max_gap_ms=None
     memory_samples=deque(maxlen=64);next_memory=0;latest_snapshot=None
     window='SPARTAN-6 | CPU-FPGA PIPELINE'
+    trace=BoundedLog(directory/'trace.jsonl',formatter=lambda event:json.dumps(event)+'\n')
     try:
         pipe.start()
         if not args.headless: cv2.namedWindow(window,cv2.WINDOW_NORMAL)
@@ -375,25 +413,12 @@ def run_streaming(args, model):
             if first_capture is None and pipe.first_capture_ns is not None: first_capture=pipe.first_capture_ns
             if first_capture is not None and args.seconds and (time.perf_counter_ns()-first_capture)/1e9>=args.seconds:
                 duration_completed=True;break
-            if first_capture is None and time.perf_counter_ns()-meta['start_ns']>15e9: raise TimeoutError('No camera/source frame within 15 seconds')
+            if first_capture is None and time.perf_counter_ns()-meta['start_ns']>max(15,startup_timeout)*1e9: raise TimeoutError('No camera/source frame within startup deadline')
             try: snapshot=pipe.display.get(timeout=.03)
             except Empty: snapshot=None
             if snapshot is not None: latest_snapshot=snapshot
             if latest_snapshot is not None and not args.headless:
-                snapshot=latest_snapshot
-                item=snapshot.inference.prepared; display=item.frame.copy()
-                expired=time.perf_counter_ns()-item.capture_ns>MAXIMUM_GAP_MS*1000000
-                for side,box in item.boxes.items():
-                    x0,y0,x1,y1=box; cv2.rectangle(display,(x0,y0),(x1,y1),(80,180,180),1)
-                elapsed=max(.001,(time.perf_counter_ns()-(pipe.first_capture_ns or meta['start_ns']))/1e9)
-                kernel=snapshot.inference.hardware.pair_cycles/50000 if snapshot.inference.hardware else None
-                lines=['SPARTAN-6 | CPU-FPGA PIPELINE',f'Backend FPGA P2 | {args.pipeline.upper()} | frame {item.frame_id}',
-                    ' | '.join(s+': '+('UNAVAILABLE' if expired else snapshot.eyes[s]['state']) for s in SIDES),
-                    f'Prep {(item.prep_end_ns-item.prep_start_ns)/1e6:.2f} ms | UART {(snapshot.inference.end_ns-snapshot.inference.start_ns)/1e6:.2f} ms',
-                    f'Age {(time.perf_counter_ns()-item.capture_ns)/1e6:.1f} ms | blinks {snapshot.timing.count}',
-                    f'Capture {pipe.counts.get("capture",0)/elapsed:.1f} FPS | processed {pipe.counts.get("fpga_completed",0)/elapsed:.2f} FPS',
-                    f'Kernel pair {kernel} ms | prep drops {pipe.counts.get("dropped_preparation",0)} | RUNNING {snapshot.reason or ""}']
-                for n,line in enumerate(lines): cv2.putText(display,line,(8,25+22*n),cv2.FONT_HERSHEY_SIMPLEX,.5,(100,235,180),1,cv2.LINE_AA)
+                display=render_stream_preview(latest_snapshot,time.perf_counter_ns(),pipe.counts,pipe.first_capture_ns or meta['start_ns'],args.pipeline)
                 cv2.imshow(window,display)
             if not args.headless:
                 ui_now=time.perf_counter_ns();ui_polls+=1
@@ -409,12 +434,14 @@ def run_streaming(args, model):
     except Exception as exc:
         meta.update(status='FAIL',error=str(exc)); exit_code=1
     finally:
-        try: pipe.close(); pipe.raise_error()
+        try: pipe.close(timeout=max(6,startup_timeout)); pipe.raise_error()
         except Exception as exc: meta.update(status='FAIL',shutdown_error=str(exc));exit_code=1
         meta.update(end_ns=time.perf_counter_ns(),identity=pipe.identity,integrity=pipe.integrity,clean_shutdown=not any(w.is_alive() for w in pipe.threads),
             completed_requested_duration=duration_completed,ui_poll_count=ui_polls,ui_max_poll_gap_ms=ui_max_gap_ms,
             ui_thread_id=__import__('threading').get_ident(),memory_samples=list(memory_samples))
-        trace.close()
+        try: trace.close()
+        except Exception as exc: meta.update(status='FAIL',trace_error=str(exc));exit_code=1
+        meta['trace_writer_clean_shutdown']=not trace.worker.is_alive()
         if not args.headless: cv2.destroyAllWindows()
         write_json(report,meta)
         summarize(directory,meta,args.frames)
@@ -422,7 +449,7 @@ def run_streaming(args, model):
     return exit_code
 
 
-def live_cli(argv=None, forced_backend=None):
+def live_cli(argv=None, forced_backend=None, client_factory=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, help="Explicit legacy TinyEye manifest; cannot be combined with --network pretrained")
     parser.add_argument("--network", choices=("pretrained", "tiny"), help="Default: pretrained; explicit --manifest selects TinyEye")
@@ -484,11 +511,11 @@ def live_cli(argv=None, forced_backend=None):
         print(f"BACKEND: {args.backend}; workers={args.workers}; camera/UART not opened")
         return 0
     if args.pipeline:
-        if not pretrained or args.backend != 'fpga' or experiment:
-            parser.error('--pipeline requires the pretrained FPGA backend')
+        if args.backend != 'fpga' or experiment or not model.ready:
+            parser.error('--pipeline requires a trained FPGA model without experiment mode')
         if args.warmup_seconds<0 or not np.isfinite(args.warmup_seconds) or args.replay_count<1 or not np.isfinite(args.replay_fps) or args.replay_fps<=0:
             parser.error('Invalid pipeline warmup or replay configuration')
-        return run_streaming(args,model)
+        return run_streaming(args,model,client_factory)
     if args.headless or args.replay_manifest:
         parser.error('--headless/--replay-manifest require an explicit --pipeline')
     if args.backend == "fpga" and not model.ready:
@@ -536,7 +563,7 @@ def live_cli(argv=None, forced_backend=None):
                 "fpga_left_cycles", "fpga_right_cycles", "fpga_pair_cycles", "validity", "error_reason"))
             writer.writeheader()
         if args.backend in ("fpga", "compare"):
-            client = FPGAClient(args.port, baud=stats["baud"]) if pretrained or args.baud else FPGAClient(args.port)
+            client = client_factory() if client_factory is not None else (FPGAClient(args.port, baud=stats["baud"]) if pretrained or args.baud else FPGAClient(args.port))
             status = client.ping()
             if not status.get("binocular_timing"):
                 raise RuntimeError("FPGA firmware does not support the existing binocular timer")

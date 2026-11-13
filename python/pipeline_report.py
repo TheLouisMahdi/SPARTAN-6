@@ -19,7 +19,10 @@ def summarize(directory, metadata, frames_path=None):
     published=[e for e in events if e['kind']=='published']
     captures=[e for e in events if e['kind']=='capture']
     begin=(captures[0]['capture_ns'] if captures else metadata['start_ns'])+int(metadata.get('warmup_seconds',0)*1e9)
-    end=metadata['end_ns']
+    # Configuration/rollback can take seconds. Inference throughput uses only
+    # recorded data-stage events, never firmware setup or session cleanup.
+    endpoints=[e[key] for e in events for key in ('capture_ns','prep_end_ns','fpga_end_ns','result_end_ns') if key in e]
+    end=max(endpoints) if endpoints else metadata['end_ns']
     duration=max(0,end-begin)/1e9
     selected=[e for e in published if e['capture_ns']>=begin]
     ids={e['frame_id'] for e in selected}
@@ -46,6 +49,7 @@ def summarize(directory, metadata, frames_path=None):
     summary=dict(status=metadata['status'],provenance=metadata.get('provenance','NOT_AVAILABLE'),scope=metadata['source'],
         model_sha256=metadata.get('model_sha256'),bitstream_sha256=metadata.get('bitstream_sha256_local_artifact'),baud=metadata.get('baud'),verify=metadata.get('verify'),
         pipeline_mode=metadata['mode'],measurement_seconds=duration,warmup_seconds=metadata.get('warmup_seconds',0),counts=counts,
+        measurement_window_definition='first capture plus warmup through last data-stage event; firmware setup and rollback excluded',
         unpublished_completed_frame_ids=sorted({e['frame_id'] for e in events if e['kind']=='fpga_completed'}-{e['frame_id'] for e in published}),
         invalid_eye_pairs=sum(e['reason']=='missing_eye' for e in selected),stale_frames=sum(e['reason'] in ('stale_input','stale_result') for e in selected),
         dropped_capture_frames=counts.get('dropped_capture',0),dropped_preparation_frames=counts.get('dropped_preparation',0),
@@ -56,7 +60,8 @@ def summarize(directory, metadata, frames_path=None):
         preparation=latency([(e['prep_end_ns']-e['prep_start_ns'])/1e6 for e in pselected]),
         landmarks=latency([(e['landmark_end_ns']-e['landmark_start_ns'])/1e6 for e in events if e['kind']=='preparation_components' and e['capture_ns']>=begin]),
         roi_extraction=latency([(e['roi_end_ns']-e['landmark_end_ns'])/1e6 for e in events if e['kind']=='preparation_components' and e['capture_ns']>=begin]),
-        fpga_kernel_pair=latency([e['cycles'][2]/50000 for e in hw]),
+        fpga_kernel_pair=latency([(e['cycles'][0]+e['cycles'][1])/50000 for e in hw]),
+        fpga_controller_pair=latency([e['cycles'][2]/50000 for e in hw]),
         uart_roundtrip=latency([e['uart_roundtrip_ms'] for e in hw]),
         uart_upload=latency([e['uart_upload_ms'] for e in hw if e.get('uart_upload_ms') is not None]),
         end_to_end=latency([(e['result_end_ns']-e['capture_ns'])/1e6 for e in selected]),
